@@ -306,7 +306,7 @@ If you use this code in your research, please cite:
   author = {Your Name},
   title = {Advanced RAG System},
   year = {2024},
-  url = {https://github.com/yourusername/advanced-rag}
+  url = {https://github.com/ClementMathe/advanced-rag}
 }
 ```
 
@@ -319,11 +319,11 @@ If you use this code in your research, please cite:
 
 ## Contact
 
-- GitHub: [@yourusername](https://github.com/yourusername)
-- Email: your.email@example.com
+- GitHub: [@ClementMathe](https://github.com/ClementMathe)
+- Email: clementmathe1@gmail.com.com
 
 ---
 
-**Status**: 🚧 Active Development
+**Status**: Active Development
 
-Last Updated: December 2024
+Last Updated: December 2025

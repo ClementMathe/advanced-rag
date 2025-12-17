@@ -65,6 +65,9 @@ index/*.index
 index/*.faiss
 outputs/models/
 outputs/checkpoints/
+outputs/chunking_comparison
+data/cache
+data/squad
 
 # Model downloads (HuggingFace cache)
 models/

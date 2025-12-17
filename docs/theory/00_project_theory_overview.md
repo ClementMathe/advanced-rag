@@ -381,4 +381,4 @@ This architecture balances:
 - What are the failure modes of semantic search?
 - How do you balance retrieval depth vs. generation quality?
 
-Continue to **[01_embeddings.md](01_embeddings.md)** →
+Continue to **[01_chunking_theory.md](01_chunking_theory.md)** →
