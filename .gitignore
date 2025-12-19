@@ -61,11 +61,11 @@ logs/
 # Data directories (large files)
 data/raw/
 data/processed/
-index/*.index
-index/*.faiss
+index/
 outputs/models/
 outputs/checkpoints/
 outputs/chunking_comparison
+outputs/retrieval_test
 data/cache
 data/squad
 
