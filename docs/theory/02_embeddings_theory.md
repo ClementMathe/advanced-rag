@@ -121,7 +121,7 @@ This block is **stacked N times** (e.g. 12, 24 layers).
 |                                |
 | Multi-Head Self-Attention:     |
 | head1 → H1_head1               |
-| head2 → H1_head2               |
+| head2 → H2_head2               |
 | ...                            |
 | Concatenate → Linear Projection|
 | → H1_tokens = [h1,h2,h3]       |

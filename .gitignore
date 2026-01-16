@@ -62,6 +62,7 @@ logs/
 data/raw/
 data/processed/
 index/
+outputs/
 outputs/models/
 outputs/checkpoints/
 outputs/chunking_comparison
