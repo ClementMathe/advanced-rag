@@ -385,6 +385,17 @@ Graded docs: 8/10
 Steps: Retrieved 10 docs → Graded: 8/10 relevant → Generated answer
 ```
 
+### Task 1.5: tests/test_agentic_pipeline.py (baseline)
+**Goal**: Unit tests for AgenticRAGPipeline MVP (before Phase 2)
+**Implementation**:
+- Test RAGState initialization
+- Test individual nodes with mocks (retrieve, grade, generate)
+- Test graph compilation
+- Verify intermediate_steps accumulation
+**Files to create**:
+- tests/test_agentic_pipeline.py (~150 lines)
+**Coverage target**: >80% on src/agentic_pipeline.py
+
 ---
 
 ## Phase 2: Self-Correction (Priority 2)
@@ -520,9 +531,15 @@ def _build_graph(self):
 
 ---
 
-### Task 2.4: Test self-correction
-
-**Create**: `tests/test_agentic_retry.py`
+### Task 2.4: Extend tests/test_agentic_pipeline.py
+**Goal**: Add tests for Phase 2 features (retry logic, routing)
+**Implementation**:
+- Test decide_to_generate() routing logic
+- Test retry_count increment
+- Test query_history loop detection
+- Test max retry limit (3)
+**Files to modify**:
+- tests/test_agentic_pipeline.py (add ~100 lines)
 
 ```python
 def test_retry_on_poor_retrieval():
@@ -539,7 +556,7 @@ def test_max_retries_fallback():
     ...
 ```
 
-**Run**: `pytest tests/test_agentic_retry.py -v`
+**Run**: `pytest tests/test_agentic_pipeline.py -v`
 
 ---
 
@@ -682,6 +699,8 @@ recall@5: +2.1%
 retry_rate: 18%
 avg_retries: 0.24
 ```
+
+**Note** To see the correct value of parameters refer to docs/experiments/step6_generation_analysis.md
 
 ---
 
