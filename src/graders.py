@@ -259,20 +259,18 @@ class QueryRewriter:
     """
 
     REWRITE_PROMPT = (
-        "You are a search query optimizer.\n"
+        "Rewrite this search query to be more specific. Maximum 15 words.\n"
         "\n"
-        "The original query retrieved {num_total} documents, but only {num_relevant} were relevant.\n"
+        "Rules:\n"
+        "- Replace pronouns with names (she -> Beyonce)\n"
+        "- Add key context words\n"
+        "- Output ONLY the rewritten query, nothing else\n"
+        "- No explanations, no code, no multiple questions\n"
         "\n"
-        "Improve the query to get better search results.\n"
+        "Original: {query}\n"
+        "({num_relevant}/{num_total} documents were relevant)\n"
         "\n"
-        "Strategies:\n"
-        "1. Resolve pronouns (she \u2192 Beyonc\u00e9)\n"
-        '2. Add context (debut \u2192 debut solo album "Dangerously in Love")\n'
-        "3. Clarify ambiguity (awards \u2192 Grammy awards)\n"
-        "\n"
-        "Original query: {query}\n"
-        "\n"
-        "Improved query (one line, no explanation):"
+        "Rewritten:"
     )
 
     def __init__(self, generator: LLMGenerator):
@@ -310,7 +308,7 @@ class QueryRewriter:
 
         # Save and override max_new_tokens for short response
         original_max_tokens = self.generator.max_new_tokens
-        self.generator.max_new_tokens = 50
+        self.generator.max_new_tokens = 30
         try:
             response = self.generator._generate_text(prompt)
         finally:
@@ -324,8 +322,12 @@ class QueryRewriter:
         """
         Parse and clean the rewritten query from LLM output.
 
-        Extracts the first meaningful line from the response, removing
-        any explanations, quotes, or prefixes the LLM may have added.
+        Extracts a single clean query from the response by:
+        1. Taking the first line only
+        2. Stripping common prefixes and quotes
+        3. Truncating at prompt injection boundaries (Human:, ```, etc.)
+        4. Truncating at the first '?' to keep a single question
+        5. Enforcing a max length (2x original query)
 
         Args:
             response: Raw LLM output text.
@@ -347,8 +349,11 @@ class QueryRewriter:
         prefixes_to_remove = [
             "Improved query:",
             "Rewritten query:",
+            "Rewritten:",
             "Better query:",
             "Query:",
+            "The rewritten",
+            "You can",
         ]
         for prefix in prefixes_to_remove:
             if first_line.lower().startswith(prefix.lower()):
@@ -359,6 +364,31 @@ class QueryRewriter:
             first_line.startswith("'") and first_line.endswith("'")
         ):
             first_line = first_line[1:-1].strip()
+
+        # Strip code fences (```sql, ```, etc.)
+        first_line = re.sub(r"```[a-z]*", "", first_line).strip()
+
+        # Truncate at prompt injection boundaries
+        for boundary in ["Human:", "Assistant:", "User:", "System:"]:
+            idx = first_line.find(boundary)
+            if idx > 0:
+                first_line = first_line[:idx].strip()
+                logger.debug(f"Truncated rewrite at '{boundary}'")
+
+        # Truncate at first '?' to keep only one question
+        q_idx = first_line.find("?")
+        if q_idx >= 0:
+            first_line = first_line[: q_idx + 1].strip()
+
+        # Max length cap: 2x original query length
+        max_len = max(len(original_query) * 2, 60)
+        if len(first_line) > max_len:
+            # Truncate at last word boundary within limit
+            truncated = first_line[:max_len].rsplit(" ", 1)[0]
+            logger.debug(
+                f"Rewrite too long ({len(first_line)} chars), " f"truncated to {len(truncated)}"
+            )
+            first_line = truncated
 
         # Fallback if result is empty or too short
         if len(first_line) < 3:

@@ -362,7 +362,7 @@ class TestQueryRewriter:
         assert result == "original query"
 
     def test_max_tokens_override_and_restore(self, rewriter):
-        """max_new_tokens should be temporarily set to 50 and then restored."""
+        """max_new_tokens should be temporarily set to 30 and then restored."""
         rewriter.generator.max_new_tokens = 256
         rewriter.generator._generate_text.return_value = "rewritten query text"
 
@@ -406,6 +406,150 @@ class TestQueryRewriter:
         result = rewriter.rewrite("original query", num_total=10, num_relevant=0)
 
         assert result == "original query"
+
+    # --- Fix A: Hardened parsing tests ---
+
+    def test_strips_code_fences_sql(self, rewriter):
+        """Code fences like ```sql should be stripped from rewrites."""
+        rewriter.generator._generate_text.return_value = (
+            "What competitions did Beyonce do as a child? ```sql"
+        )
+
+        result = rewriter.rewrite("competitions?", num_total=10, num_relevant=1)
+
+        assert "```" not in result
+        assert "sql" not in result
+        assert result == "What competitions did Beyonce do as a child?"
+
+    def test_strips_code_fences_trailing(self, rewriter):
+        """Trailing code fences should be stripped."""
+        rewriter.generator._generate_text.return_value = "What was her role? ```"
+
+        result = rewriter.rewrite("her role?", num_total=10, num_relevant=1)
+
+        assert "```" not in result
+        assert result == "What was her role?"
+
+    def test_truncates_at_human_boundary(self, rewriter):
+        """Everything after 'Human:' should be removed."""
+        rewriter.generator._generate_text.return_value = (
+            "When did Beyonce become famous?Human: Can you suggest keywords?"
+        )
+
+        result = rewriter.rewrite("fame?", num_total=10, num_relevant=1)
+
+        assert "Human:" not in result
+        assert result == "When did Beyonce become famous?"
+
+    def test_truncates_at_assistant_boundary(self, rewriter):
+        """Everything after 'Assistant:' should be removed."""
+        rewriter.generator._generate_text.return_value = (
+            "What decade did Beyonce rise?Assistant: Here are some tips"
+        )
+
+        result = rewriter.rewrite("decade?", num_total=10, num_relevant=1)
+
+        assert "Assistant:" not in result
+        assert result == "What decade did Beyonce rise?"
+
+    def test_truncates_at_user_boundary(self, rewriter):
+        """Everything after 'User:' should be removed."""
+        rewriter.generator._generate_text.return_value = (
+            "Beyonce childhood competitions?User: Thanks"
+        )
+
+        result = rewriter.rewrite("competitions?", num_total=10, num_relevant=1)
+
+        assert "User:" not in result
+        assert result == "Beyonce childhood competitions?"
+
+    def test_truncates_at_first_question_mark(self, rewriter):
+        """Only the first question should be kept."""
+        rewriter.generator._generate_text.return_value = (
+            "When did Beyonce become famous? In which decade did she rise? "
+            "What year was her debut?"
+        )
+
+        result = rewriter.rewrite("fame?", num_total=10, num_relevant=1)
+
+        assert result == "When did Beyonce become famous?"
+
+    def test_keeps_query_without_question_mark(self, rewriter):
+        """Queries without '?' should not be truncated."""
+        rewriter.generator._generate_text.return_value = "Beyonce Grammy debut album 2003"
+
+        result = rewriter.rewrite("awards", num_total=10, num_relevant=0)
+
+        assert result == "Beyonce Grammy debut album 2003"
+
+    def test_max_length_cap(self, rewriter):
+        """Rewrite longer than 2x original should be truncated."""
+        long_rewrite = "word " * 30  # 150 chars, way over 2x a short query
+        rewriter.generator._generate_text.return_value = long_rewrite.strip()
+
+        result = rewriter.rewrite("short query", num_total=10, num_relevant=1)
+
+        # max_len = max(len("short query") * 2, 60) = 60
+        assert len(result) <= 60
+
+    def test_max_length_uses_word_boundary(self, rewriter):
+        """Length truncation should not cut words in half."""
+        rewriter.generator._generate_text.return_value = (
+            "What specific singing dancing competitions did Beyonce participate "
+            "in during her childhood years growing up"
+        )
+
+        result = rewriter.rewrite("competitions", num_total=10, num_relevant=1)
+
+        # Should not end mid-word
+        assert not result.endswith("-")
+        assert result == result.rstrip()  # no trailing space
+
+    def test_combined_code_fence_and_human_injection(self, rewriter):
+        """Real-world case: code fence + Human: prompt injection."""
+        rewriter.generator._generate_text.return_value = (
+            "What was Beyonce's role in Destiny's Child? "
+            "```What was her role?```"
+            "Human: Can you provide tips?"
+        )
+
+        result = rewriter.rewrite("What role did she have?", num_total=5, num_relevant=1)
+
+        assert "```" not in result
+        assert "Human:" not in result
+        assert result == "What was Beyonce's role in Destiny's Child?"
+
+    def test_repetitive_questions_truncated(self, rewriter):
+        """Real-world case: LLM repeats the question multiple times."""
+        rewriter.generator._generate_text.return_value = (
+            "When did Beyonce become famous? To which decade did Beyonce "
+            "become famous? In which decade was she famous?"
+        )
+
+        result = rewriter.rewrite("fame decade?", num_total=10, num_relevant=1)
+
+        assert result == "When did Beyonce become famous?"
+
+    def test_max_new_tokens_is_30(self, rewriter):
+        """Rewriter should use max_new_tokens=30 during generation."""
+        rewriter.generator.max_new_tokens = 256
+        rewriter.generator._generate_text.return_value = "better query"
+
+        rewriter.rewrite("query", num_total=10, num_relevant=0)
+
+        # Check that max_new_tokens was set to 30 during the call
+        # (it's restored after, so we check it's back to 256)
+        assert rewriter.generator.max_new_tokens == 256
+
+    def test_strips_rewritten_prefix(self, rewriter):
+        """'Rewritten:' prefix (from prompt echo) should be stripped."""
+        rewriter.generator._generate_text.return_value = (
+            "Rewritten: What Grammy awards did Beyonce win?"
+        )
+
+        result = rewriter.rewrite("awards?", num_total=10, num_relevant=1)
+
+        assert result == "What Grammy awards did Beyonce win?"
 
 
 class TestDocumentGraderPrompts:

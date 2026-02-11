@@ -132,7 +132,7 @@ class TestPipelineInit:
         )
 
         assert pipeline.k_retrieve == 20
-        assert pipeline.k_rerank == 10
+        assert pipeline.k_rerank == 5
 
     def test_init_default_retry_values(self):
         """Default min_relevant=3, max_retries=3."""
@@ -546,8 +546,8 @@ class TestRewriteQueryNode:
 
         pipeline.query_rewriter.rewrite.assert_called_once_with("original query", 3, 1)
 
-    def test_uses_rewritten_query_if_available(self, pipeline):
-        """On subsequent retries, should rewrite from the rewritten query."""
+    def test_always_rewrites_from_original_query(self, pipeline):
+        """On subsequent retries, should rewrite from original query (not previous rewrite)."""
         state = make_state(
             query="original query",
             rewritten_query="already rewritten",
@@ -557,7 +557,7 @@ class TestRewriteQueryNode:
 
         pipeline._rewrite_query_node(state)
 
-        pipeline.query_rewriter.rewrite.assert_called_once_with("already rewritten", 1, 0)
+        pipeline.query_rewriter.rewrite.assert_called_once_with("original query", 1, 0)
 
     def test_logs_intermediate_step(self, pipeline):
         """Node should log the rewrite action."""
@@ -585,40 +585,46 @@ class TestGenerateNode:
             query_rewriter=rewriter,
         )
 
-    def test_generates_from_graded_docs(self, pipeline):
-        """Node should generate answer from graded documents."""
-        graded = [make_doc("relevant doc")]
+    def test_generates_from_all_reranked_docs(self, pipeline):
+        """Node should generate answer from all reranked documents, not just graded."""
+        docs = [make_doc("d1"), make_doc("d2")]
+        graded = [make_doc("d1")]  # grading filtered one, but generate uses all
         state = make_state(
             query="When was Beyonce born?",
-            documents=[make_doc("d1"), make_doc("d2")],
+            documents=docs,
             graded_documents=graded,
         )
 
         result = pipeline._generate_node(state)
 
         assert result["generation"] == "Beyonce was born in 1981."
+        # Verify all reranked docs were passed, not just graded
+        call_args = pipeline.generator.generate.call_args[0]
+        assert call_args[1] == docs
 
-    def test_calls_generator_with_query_and_docs(self, pipeline):
-        """Generator should receive original query and graded docs."""
-        graded = [make_doc("relevant doc")]
+    def test_calls_generator_with_query_and_all_docs(self, pipeline):
+        """Generator should receive original query and all reranked docs."""
+        docs = [make_doc("d1"), make_doc("d2"), make_doc("d3")]
         state = make_state(
             query="When was Beyonce born?",
-            graded_documents=graded,
+            documents=docs,
+            graded_documents=[make_doc("d1")],
         )
 
         pipeline._generate_node(state)
 
         pipeline.generator.generate.assert_called_once_with(
-            "When was Beyonce born?", graded, max_chunks=5
+            "When was Beyonce born?", docs, max_chunks=5
         )
 
     def test_uses_original_query_not_rewritten(self, pipeline):
         """Generator should always use the original query, not the rewritten one."""
-        graded = [make_doc("relevant doc")]
+        docs = [make_doc("relevant doc")]
         state = make_state(
             query="When was she born?",
             rewritten_query="Beyonce birth year",
-            graded_documents=graded,
+            documents=docs,
+            graded_documents=docs,
         )
 
         pipeline._generate_node(state)
@@ -626,8 +632,8 @@ class TestGenerateNode:
         call_args = pipeline.generator.generate.call_args[0]
         assert call_args[0] == "When was she born?"
 
-    def test_fallback_to_top3_when_no_graded_docs(self, pipeline):
-        """When graded_documents is empty, should fall back to top-3 retrieved."""
+    def test_generates_even_when_no_graded_docs(self, pipeline):
+        """When graded_documents is empty, should still use all reranked docs."""
         retrieved = [
             make_doc("d1", "1"),
             make_doc("d2", "2"),
@@ -640,11 +646,11 @@ class TestGenerateNode:
 
         call_args = pipeline.generator.generate.call_args
         docs_used = call_args[0][1]
-        assert len(docs_used) == 3
+        assert len(docs_used) == 4
         assert docs_used[0]["doc_id"] == "1"
 
-    def test_fallback_when_fewer_than_3_retrieved(self, pipeline):
-        """Fallback should use all available docs if fewer than 3."""
+    def test_generates_with_few_retrieved(self, pipeline):
+        """Should pass all available docs even if fewer than max_chunks."""
         retrieved = [make_doc("d1", "1"), make_doc("d2", "2")]
         state = make_state(query="query", documents=retrieved, graded_documents=[])
 
@@ -655,14 +661,16 @@ class TestGenerateNode:
         assert len(docs_used) == 2
 
     def test_logs_intermediate_step(self, pipeline):
-        """Node should log how many docs were used for generation."""
+        """Node should log total docs and graded count."""
+        docs = [make_doc("A"), make_doc("B"), make_doc("C")]
         graded = [make_doc("A"), make_doc("B")]
-        state = make_state(query="q", graded_documents=graded)
+        state = make_state(query="q", documents=docs, graded_documents=graded)
 
         result = pipeline._generate_node(state)
 
         assert len(result["intermediate_steps"]) == 1
-        assert "2" in result["intermediate_steps"][0]
+        assert "3" in result["intermediate_steps"][0]  # 3 total docs
+        assert "2" in result["intermediate_steps"][0]  # 2 graded relevant
 
 
 class TestQueryMethodNoRetry:

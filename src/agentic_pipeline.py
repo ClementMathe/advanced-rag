@@ -80,7 +80,7 @@ class AgenticRAGPipeline:
         grader: DocumentGrader,
         query_rewriter: QueryRewriter,
         k_retrieve: int = 20,
-        k_rerank: int = 10,
+        k_rerank: int = 5,
         min_relevant: int = 3,
         max_retries: int = 3,
     ):
@@ -259,8 +259,8 @@ class AgenticRAGPipeline:
     def _rewrite_query_node(self, state: RAGState) -> dict:
         """Rewrite the query to improve retrieval on retry.
 
-        Uses QueryRewriter to generate an improved version of the query
-        based on retrieval statistics from the current cycle.
+        Always rewrites from the original query to prevent compound drift
+        (each retry gets a fresh take rather than rewriting a rewrite).
 
         Args:
             state: Current graph state with grading results.
@@ -268,14 +268,14 @@ class AgenticRAGPipeline:
         Returns:
             State update with rewritten query, updated history, and retry count.
         """
-        current_query = state.get("rewritten_query") or state["query"]
+        original_query = state["query"]
         num_relevant = len(state.get("graded_documents", []))
         num_total = len(state.get("documents", []))
 
         with Timer("Query rewriting"):
-            new_query = self.query_rewriter.rewrite(current_query, num_total, num_relevant)
+            new_query = self.query_rewriter.rewrite(original_query, num_total, num_relevant)
 
-        step = f"Rewrote: '{current_query}' -> '{new_query}'"
+        step = f"Rewrote: '{original_query}' -> '{new_query}'"
         logger.info(step)
 
         return {
@@ -286,29 +286,27 @@ class AgenticRAGPipeline:
         }
 
     def _generate_node(self, state: RAGState) -> dict:
-        """Generate answer from graded documents.
+        """Generate answer from all reranked documents.
 
-        Uses the original query for generation. Falls back to top-3
-        retrieved docs if no documents passed grading.
+        Uses the original query for generation. Grading is used only for
+        the retry decision, not for filtering the generation context —
+        the reranker already selected the most relevant docs.
 
         Args:
-            state: Current graph state with graded documents.
+            state: Current graph state with documents.
 
         Returns:
             State update with generated answer and step log.
         """
         query = state["query"]
-        docs = state.get("graded_documents", [])
+        docs = state.get("documents", [])
 
-        # Fallback: use top retrieved docs if grading filtered everything
-        if not docs:
-            docs = state.get("documents", [])[:3]
-            logger.warning("No graded docs, falling back to top-3 retrieved")
+        num_graded = len(state.get("graded_documents", []))
 
         with Timer("Generation"):
             result = self.generator.generate(query, docs, max_chunks=5)
 
-        step = f"Generated answer using {len(docs)} docs"
+        step = f"Generated answer using {len(docs)} docs ({num_graded} graded relevant)"
         logger.info(step)
 
         return {
@@ -354,10 +352,7 @@ class AgenticRAGPipeline:
         logger.info(f"Steps: {' -> '.join(final_state['intermediate_steps'])}")
 
         # Reconstruct docs used for generation (same logic as _generate_node)
-        gen_docs = final_state["graded_documents"]
-        if not gen_docs:
-            gen_docs = final_state["documents"][:3]
-        gen_docs = gen_docs[:5]  # max_chunks=5 in generate
+        gen_docs = final_state["documents"][:5]  # max_chunks=5 in generate
 
         return {
             "query": query,

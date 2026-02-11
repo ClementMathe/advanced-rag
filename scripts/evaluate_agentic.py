@@ -382,9 +382,9 @@ def main():
         grader=grader,
         query_rewriter=query_rewriter,
         k_retrieve=20,
-        k_rerank=10,
-        min_relevant=3,
-        max_retries=3,
+        k_rerank=5,
+        min_relevant=2,
+        max_retries=1,
     )
 
     # Metrics calculator (reuses embed_model for faithfulness)
