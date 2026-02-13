@@ -89,6 +89,9 @@ temp/
 .AppleDouble
 .LSOverride
 
+# Claude Code session files
+.claude/
+
 # Windows
 Thumbs.db
 ehthumbs.db
