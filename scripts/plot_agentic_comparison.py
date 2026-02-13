@@ -1,131 +1,145 @@
 """
-Generate comparison visualizations for agentic vs linear RAG evaluation.
+Generate comparison visualizations for 3-config agentic RAG ablation.
 
-Reads JSON results from scripts/evaluate_agentic.py and produces 3 plots:
-1. Bar chart: Metrics comparison (Linear vs Agentic)
-2. Histogram: Retry count distribution
-3. Scatter: Per-query F1 improvement vs retry count
+Reads JSON results from scripts/evaluate_agentic.py and produces 5 plots:
+1. Bar chart: 3-config metrics comparison (Linear vs Adaptive vs Adaptive+Web)
+2. Histogram: Rerank score distribution colored by fallback trigger
+3. Scatter: Per-query F1 delta (adaptive - linear) by fallback group
+4. Grouped bars: Fallback impact breakdown (F1 + faithfulness)
+5. Box plot: Latency comparison across configs
 
 Usage:
     python scripts/plot_agentic_comparison.py
 
 Requires outputs/agentic_eval/ to contain:
-    - comparison.json
+    - ablation_comparison.json
     - linear_results.json
-    - agentic_results.json
+    - adaptive_results.json
+    - adaptive_web_results.json
 """
 
 import json
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from loguru import logger
+from matplotlib.lines import Line2D
 
 INPUT_DIR = Path("outputs/agentic_eval")
-OUTPUT_DIR = INPUT_DIR  # Save plots alongside data
+OUTPUT_DIR = INPUT_DIR
+
+# Consistent color palette
+COLOR_LINEAR = "#4A90D9"
+COLOR_ADAPTIVE = "#2ECC71"
+COLOR_WEB = "#E67E22"
+COLOR_POSITIVE = "#27AE60"
+COLOR_NEGATIVE = "#E74C3C"
+COLOR_FALLBACK = "#E88D72"
+COLOR_NO_FALLBACK = "#5DADE2"
 
 
-def load_results():
+def load_results() -> Tuple[Dict, List[Dict], List[Dict], List[Dict]]:
     """Load evaluation results from JSON files.
 
     Returns:
-        Tuple of (comparison, linear_results, agentic_results) dicts.
+        Tuple of (comparison, linear_results, adaptive_results, adaptive_web_results).
     """
-    with open(INPUT_DIR / "comparison.json", "r") as f:
+    with open(INPUT_DIR / "ablation_comparison.json", "r") as f:
         comparison = json.load(f)
 
     with open(INPUT_DIR / "linear_results.json", "r") as f:
         linear_results = json.load(f)
 
-    with open(INPUT_DIR / "agentic_results.json", "r") as f:
-        agentic_results = json.load(f)
+    with open(INPUT_DIR / "adaptive_results.json", "r") as f:
+        adaptive_results = json.load(f)
 
-    return comparison, linear_results, agentic_results
+    with open(INPUT_DIR / "adaptive_web_results.json", "r") as f:
+        adaptive_web_results = json.load(f)
+
+    return comparison, linear_results, adaptive_results, adaptive_web_results
 
 
-def plot_metrics_comparison(comparison: dict, output_dir: Path) -> None:
-    """Plot 1: Side-by-side bar chart of Linear vs Agentic metrics.
+def plot_metrics_comparison(comparison: Dict, output_dir: Path) -> None:
+    """Plot 1: 3-config grouped bar chart of F1, ROUGE-L, Faithfulness.
 
     Args:
-        comparison: Comparison dict with 'linear' and 'agentic' aggregate metrics.
+        comparison: Ablation comparison dict with configs and deltas.
         output_dir: Directory to save the plot.
     """
-    metrics = ["exact_match", "f1", "rouge_l", "faithfulness"]
-    labels = ["Exact Match", "F1 Score", "ROUGE-L", "Faithfulness"]
+    metrics = ["f1", "rouge_l", "faithfulness"]
+    labels = ["F1 Score", "ROUGE-L", "Faithfulness"]
+    configs = ["linear", "adaptive", "adaptive_web"]
+    config_labels = ["Linear", "Adaptive", "Adaptive+Web"]
+    colors = [COLOR_LINEAR, COLOR_ADAPTIVE, COLOR_WEB]
 
-    linear_means = [comparison["linear"][m]["mean"] for m in metrics]
-    linear_stds = [comparison["linear"][m]["std"] for m in metrics]
-    agentic_means = [comparison["agentic"][m]["mean"] for m in metrics]
-    agentic_stds = [comparison["agentic"][m]["std"] for m in metrics]
+    means = {}
+    stds = {}
+    for cfg in configs:
+        means[cfg] = [comparison["configs"][cfg]["metrics"][m]["mean"] for m in metrics]
+        stds[cfg] = [comparison["configs"][cfg]["metrics"][m]["std"] for m in metrics]
 
     x = np.arange(len(labels))
-    width = 0.35
+    width = 0.25
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    bars_linear = ax.bar(
-        x - width / 2,
-        linear_means,
-        width,
-        yerr=linear_stds,
-        capsize=4,
-        label="Linear (Step 6)",
-        color="#4A90D9",
-        alpha=0.85,
-        edgecolor="black",
-    )
-    bars_agentic = ax.bar(
-        x + width / 2,
-        agentic_means,
-        width,
-        yerr=agentic_stds,
-        capsize=4,
-        label="Agentic (Step 6.5)",
-        color="#2ECC71",
-        alpha=0.85,
-        edgecolor="black",
-    )
-
-    # Value labels on bars
-    for bars in [bars_linear, bars_agentic]:
+    for i, (cfg, label, color) in enumerate(zip(configs, config_labels, colors)):
+        offset = (i - 1) * width
+        bars = ax.bar(
+            x + offset,
+            means[cfg],
+            width,
+            yerr=stds[cfg],
+            capsize=3,
+            label=label,
+            color=color,
+            alpha=0.85,
+            edgecolor="black",
+            linewidth=0.5,
+        )
         for bar in bars:
             height = bar.get_height()
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
                 height + 0.02,
-                f"{height:.2f}",
+                f"{height:.3f}",
                 ha="center",
                 va="bottom",
-                fontsize=9,
+                fontsize=8,
                 fontweight="bold",
             )
 
-    # Delta annotations
+    # Delta annotations for adaptive vs linear
+    deltas = comparison["deltas_vs_linear"]
     for i, metric in enumerate(metrics):
-        delta = comparison["delta"][metric]
-        sign = "+" if delta >= 0 else ""
-        color = "#27AE60" if delta >= 0 else "#E74C3C"
-        ax.annotate(
-            f"{sign}{delta:.2%}",
-            xy=(x[i] + width / 2, agentic_means[i] + agentic_stds[i] + 0.05),
-            ha="center",
-            fontsize=8,
-            fontweight="bold",
-            color=color,
-        )
+        for j, cfg in enumerate(["adaptive", "adaptive_web"]):
+            delta = deltas[cfg][metric]
+            sign = "+" if delta >= 0 else ""
+            color = COLOR_POSITIVE if delta >= 0 else COLOR_NEGATIVE
+            bar_x = x[i] + (j) * width  # offset for adaptive (j=0→0), web (j=1→width)
+            bar_y = means[cfg][i] + stds[cfg][i] + 0.04
+            ax.annotate(
+                f"{sign}{delta:.1%}",
+                xy=(bar_x, bar_y),
+                ha="center",
+                fontsize=7,
+                fontweight="bold",
+                color=color,
+            )
 
     ax.set_xlabel("Metric", fontsize=12)
     ax.set_ylabel("Score", fontsize=12)
     ax.set_title(
-        "Generation Quality: Linear vs Agentic Pipeline",
+        "Generation Quality: Linear vs Adaptive vs Adaptive+Web",
         fontsize=14,
         fontweight="bold",
     )
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylim(0, 1.15)
-    ax.legend(fontsize=11, loc="upper left")
+    ax.legend(fontsize=10, loc="upper left")
     ax.grid(True, axis="y", alpha=0.3)
 
     plt.tight_layout()
@@ -135,151 +149,197 @@ def plot_metrics_comparison(comparison: dict, output_dir: Path) -> None:
     plt.close()
 
 
-def plot_retry_distribution(agentic_results: list, output_dir: Path) -> None:
-    """Plot 2: Histogram of retry counts across queries.
+def plot_rerank_score_distribution(adaptive_results: List[Dict], output_dir: Path) -> None:
+    """Plot 2: Histogram of rerank scores colored by fallback trigger.
 
     Args:
-        agentic_results: List of per-query agentic result dicts.
+        adaptive_results: Per-query adaptive results with min_rerank_score.
         output_dir: Directory to save the plot.
     """
-    retry_counts = [r["retry_count"] for r in agentic_results]
-    max_retry = max(retry_counts) if retry_counts else 3
+    fallback_scores = [
+        r["min_rerank_score"] for r in adaptive_results if r["used_fallback_retrieval"]
+    ]
+    no_fallback_scores = [
+        r["min_rerank_score"] for r in adaptive_results if not r["used_fallback_retrieval"]
+    ]
+    all_scores = [r["min_rerank_score"] for r in adaptive_results]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    bins = np.arange(-0.5, max_retry + 1.5, 1)
-    counts, _, bars = ax.hist(
-        retry_counts,
+    bins = np.arange(-11, 7, 1)
+
+    ax.hist(
+        fallback_scores,
         bins=bins,
-        color="#9B59B6",
-        alpha=0.85,
+        color=COLOR_FALLBACK,
+        alpha=0.8,
         edgecolor="black",
-        rwidth=0.8,
+        linewidth=0.5,
+        label=f"Fallback triggered (n={len(fallback_scores)})",
+    )
+    ax.hist(
+        no_fallback_scores,
+        bins=bins,
+        color=COLOR_NO_FALLBACK,
+        alpha=0.8,
+        edgecolor="black",
+        linewidth=0.5,
+        label=f"No fallback (n={len(no_fallback_scores)})",
+        bottom=np.histogram(fallback_scores, bins=bins)[0],
     )
 
-    # Value labels on bars
-    for bar, count in zip(bars, counts):
-        if count > 0:
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                count + 0.5,
-                f"{int(count)}",
-                ha="center",
-                va="bottom",
-                fontsize=11,
-                fontweight="bold",
-            )
+    # Threshold line
+    ax.axvline(
+        x=0.0,
+        color="#2C3E50",
+        linestyle="--",
+        linewidth=2,
+        label="Threshold = 0.0",
+    )
 
-    # Percentage annotations
-    total = len(retry_counts)
-    for bar, count in zip(bars, counts):
-        if count > 0:
-            pct = count / total * 100
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                count / 2,
-                f"{pct:.0f}%",
-                ha="center",
-                va="center",
-                fontsize=10,
-                color="white",
-                fontweight="bold",
-            )
-
-    ax.set_xlabel("Number of Retries", fontsize=12)
-    ax.set_ylabel("Number of Queries", fontsize=12)
-    ax.set_title("Retry Distribution (Agentic Pipeline)", fontsize=14, fontweight="bold")
-    ax.set_xticks(range(max_retry + 1))
-    ax.set_xticklabels([str(i) for i in range(max_retry + 1)])
-    ax.grid(True, axis="y", alpha=0.3)
-
-    # Summary stats
-    avg_retries = np.mean(retry_counts)
-    retry_rate = sum(1 for r in retry_counts if r > 0) / total * 100
+    # Stats box
+    median = float(np.median(all_scores))
+    mean = float(np.mean(all_scores))
+    stats_text = (
+        f"Mean: {mean:.2f}\n"
+        f"Median: {median:.2f}\n"
+        f"Range: [{min(all_scores):.1f}, {max(all_scores):.1f}]\n"
+        f"Fallback rate: {len(fallback_scores)/len(all_scores):.0%}"
+    )
     ax.text(
         0.97,
         0.95,
-        f"Retry rate: {retry_rate:.0f}%\nAvg retries: {avg_retries:.2f}",
+        stats_text,
         transform=ax.transAxes,
         ha="right",
         va="top",
-        fontsize=10,
+        fontsize=9,
         bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
     )
 
+    ax.set_xlabel("Min Rerank Score (per query)", fontsize=12)
+    ax.set_ylabel("Number of Queries", fontsize=12)
+    ax.set_title(
+        "Rerank Score Distribution & Fallback Trigger",
+        fontsize=14,
+        fontweight="bold",
+    )
+    ax.legend(fontsize=10, loc="upper left")
+    ax.grid(True, axis="y", alpha=0.3)
+
     plt.tight_layout()
-    path = output_dir / "retry_distribution.png"
+    path = output_dir / "rerank_score_distribution.png"
     plt.savefig(path, dpi=300, bbox_inches="tight")
     logger.info(f"Saved: {path}")
     plt.close()
 
 
-def plot_f1_vs_retries(linear_results: list, agentic_results: list, output_dir: Path) -> None:
-    """Plot 3: Per-query F1 delta (agentic - linear) vs retry count.
-
-    Shows whether queries that required retries benefited from them.
+def plot_f1_delta_by_fallback(
+    linear_results: List[Dict],
+    adaptive_results: List[Dict],
+    output_dir: Path,
+) -> None:
+    """Plot 3: Per-query F1 delta scatter grouped by fallback trigger.
 
     Args:
-        linear_results: List of per-query linear result dicts.
-        agentic_results: List of per-query agentic result dicts.
+        linear_results: Per-query linear baseline results.
+        adaptive_results: Per-query adaptive results.
         output_dir: Directory to save the plot.
     """
-    # Build lookup by query_id for linear results
     linear_by_id = {r["query_id"]: r for r in linear_results}
 
-    retry_counts = []
-    f1_deltas = []
+    fallback_deltas = []
+    no_fallback_deltas = []
 
-    for agentic_r in agentic_results:
-        qid = agentic_r["query_id"]
-        linear_r = linear_by_id.get(qid)
-        if linear_r is None:
+    for ar in adaptive_results:
+        lr = linear_by_id.get(ar["query_id"])
+        if lr is None:
             continue
-
-        retry = agentic_r["retry_count"]
-        delta = agentic_r["metrics"]["f1"] - linear_r["metrics"]["f1"]
-        retry_counts.append(retry)
-        f1_deltas.append(delta)
+        delta = ar["metrics"]["f1"] - lr["metrics"]["f1"]
+        if ar["used_fallback_retrieval"]:
+            fallback_deltas.append(delta)
+        else:
+            no_fallback_deltas.append(delta)
 
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    # Jitter x for visibility
-    jitter = np.random.default_rng(42).uniform(-0.15, 0.15, len(retry_counts))
-    x_jittered = np.array(retry_counts) + jitter
+    rng = np.random.default_rng(42)
 
-    # Color by improvement direction
-    colors = ["#27AE60" if d >= 0 else "#E74C3C" for d in f1_deltas]
+    # No-fallback group (x=0)
+    jitter_nf = rng.uniform(-0.15, 0.15, len(no_fallback_deltas))
+    colors_nf = [COLOR_POSITIVE if d >= 0 else COLOR_NEGATIVE for d in no_fallback_deltas]
+    ax.scatter(
+        0 + jitter_nf,
+        no_fallback_deltas,
+        c=colors_nf,
+        alpha=0.6,
+        s=40,
+        edgecolors="black",
+        linewidths=0.3,
+    )
 
-    ax.scatter(x_jittered, f1_deltas, c=colors, alpha=0.6, s=40, edgecolors="black", linewidths=0.3)
+    # Fallback group (x=1)
+    jitter_fb = rng.uniform(-0.15, 0.15, len(fallback_deltas))
+    colors_fb = [COLOR_POSITIVE if d >= 0 else COLOR_NEGATIVE for d in fallback_deltas]
+    ax.scatter(
+        1 + jitter_fb,
+        fallback_deltas,
+        c=colors_fb,
+        alpha=0.6,
+        s=40,
+        edgecolors="black",
+        linewidths=0.3,
+    )
+
     ax.axhline(y=0, color="black", linestyle="--", alpha=0.5, linewidth=1)
 
-    # Mean delta per retry bucket
-    max_retry = max(retry_counts) if retry_counts else 0
-    for r in range(max_retry + 1):
-        bucket = [d for rc, d in zip(retry_counts, f1_deltas) if rc == r]
-        if bucket:
-            mean_d = np.mean(bucket)
-            ax.plot(r, mean_d, marker="D", color="#2C3E50", markersize=10, zorder=5)
+    # Group means
+    for i, (group, _label) in enumerate(
+        [(no_fallback_deltas, "No Fallback"), (fallback_deltas, "Fallback")]
+    ):
+        if group:
+            mean_d = float(np.mean(group))
+            ax.plot(i, mean_d, marker="D", color="#2C3E50", markersize=12, zorder=5)
             ax.annotate(
-                f"avg: {mean_d:+.3f}",
-                xy=(r, mean_d),
-                xytext=(r + 0.25, mean_d + 0.03),
-                fontsize=9,
+                f"mean: {mean_d:+.4f}",
+                xy=(i, mean_d),
+                xytext=(i + 0.25, mean_d + 0.02),
+                fontsize=10,
                 fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color="#2C3E50", lw=1.2),
             )
 
-    ax.set_xlabel("Retry Count", fontsize=12)
-    ax.set_ylabel("F1 Delta (Agentic - Linear)", fontsize=12)
+    # Count annotations
+    n_improved = sum(1 for d in fallback_deltas if d > 0)
+    n_degraded = sum(1 for d in fallback_deltas if d < 0)
+    n_same = sum(1 for d in fallback_deltas if d == 0)
+    ax.text(
+        0.97,
+        0.95,
+        f"Fallback queries (n={len(fallback_deltas)}):\n"
+        f"  Improved: {n_improved}\n"
+        f"  Same: {n_same}\n"
+        f"  Degraded: {n_degraded}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+    )
+
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(
+        [f"No Fallback\n(n={len(no_fallback_deltas)})", f"Fallback\n(n={len(fallback_deltas)})"],
+        fontsize=11,
+    )
+    ax.set_ylabel("F1 Delta (Adaptive - Linear)", fontsize=12)
     ax.set_title(
-        "Per-Query F1 Improvement by Retry Count",
+        "Per-Query F1 Impact: Adaptive vs Linear",
         fontsize=14,
         fontweight="bold",
     )
-    ax.set_xticks(range(max_retry + 1))
-    ax.grid(True, alpha=0.3)
-
-    # Legend
-    from matplotlib.lines import Line2D
+    ax.set_xlim(-0.5, 1.5)
+    ax.grid(True, axis="y", alpha=0.3)
 
     legend_elements = [
         Line2D(
@@ -287,18 +347,18 @@ def plot_f1_vs_retries(linear_results: list, agentic_results: list, output_dir: 
             [0],
             marker="o",
             color="w",
-            markerfacecolor="#27AE60",
+            markerfacecolor=COLOR_POSITIVE,
             markersize=8,
-            label="Agentic better",
+            label="Improved",
         ),
         Line2D(
             [0],
             [0],
             marker="o",
             color="w",
-            markerfacecolor="#E74C3C",
+            markerfacecolor=COLOR_NEGATIVE,
             markersize=8,
-            label="Linear better",
+            label="Degraded",
         ),
         Line2D(
             [0],
@@ -307,22 +367,226 @@ def plot_f1_vs_retries(linear_results: list, agentic_results: list, output_dir: 
             color="w",
             markerfacecolor="#2C3E50",
             markersize=8,
-            label="Bucket mean",
+            label="Group mean",
         ),
     ]
-    ax.legend(handles=legend_elements, fontsize=10, loc="upper right")
+    ax.legend(handles=legend_elements, fontsize=9, loc="upper left")
 
     plt.tight_layout()
-    path = output_dir / "f1_vs_retries.png"
+    path = output_dir / "f1_delta_by_fallback.png"
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    logger.info(f"Saved: {path}")
+    plt.close()
+
+
+def plot_fallback_impact(
+    linear_results: List[Dict],
+    adaptive_results: List[Dict],
+    output_dir: Path,
+) -> None:
+    """Plot 4: Fallback impact breakdown — F1 and Faithfulness by query group.
+
+    Args:
+        linear_results: Per-query linear baseline results.
+        adaptive_results: Per-query adaptive results.
+        output_dir: Directory to save the plot.
+    """
+    linear_by_id = {r["query_id"]: r for r in linear_results}
+
+    # Split queries by fallback trigger
+    fallback_ids = {r["query_id"] for r in adaptive_results if r["used_fallback_retrieval"]}
+    no_fallback_ids = {r["query_id"] for r in adaptive_results if not r["used_fallback_retrieval"]}
+
+    groups = {
+        "No Fallback": no_fallback_ids,
+        "Fallback": fallback_ids,
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    for ax, metric, metric_label in zip(axes, ["f1", "faithfulness"], ["F1 Score", "Faithfulness"]):
+        x = np.arange(len(groups))
+        width = 0.3
+
+        linear_means = []
+        adaptive_means = []
+
+        for _group_name, qids in groups.items():
+            lin_scores = [
+                linear_by_id[qid]["metrics"][metric] for qid in qids if qid in linear_by_id
+            ]
+            adp_scores = [r["metrics"][metric] for r in adaptive_results if r["query_id"] in qids]
+            linear_means.append(float(np.mean(lin_scores)) if lin_scores else 0)
+            adaptive_means.append(float(np.mean(adp_scores)) if adp_scores else 0)
+
+        bars_lin = ax.bar(
+            x - width / 2,
+            linear_means,
+            width,
+            label="Linear",
+            color=COLOR_LINEAR,
+            alpha=0.85,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+        bars_adp = ax.bar(
+            x + width / 2,
+            adaptive_means,
+            width,
+            label="Adaptive",
+            color=COLOR_ADAPTIVE,
+            alpha=0.85,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+
+        # Value labels
+        for bars in [bars_lin, bars_adp]:
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height + 0.01,
+                    f"{height:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    fontweight="bold",
+                )
+
+        # Delta annotations
+        for i in range(len(groups)):
+            delta = adaptive_means[i] - linear_means[i]
+            sign = "+" if delta >= 0 else ""
+            color = COLOR_POSITIVE if delta >= 0 else COLOR_NEGATIVE
+            ax.annotate(
+                f"{sign}{delta:.3f}",
+                xy=(x[i] + width / 2, adaptive_means[i] + 0.04),
+                ha="center",
+                fontsize=9,
+                fontweight="bold",
+                color=color,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(
+            [f"{name}\n(n={len(qids)})" for name, qids in groups.items()],
+            fontsize=10,
+        )
+        ax.set_ylabel(metric_label, fontsize=12)
+        ax.set_title(f"{metric_label} by Query Group", fontsize=13, fontweight="bold")
+        ax.set_ylim(0, 1.05)
+        ax.legend(fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3)
+
+    plt.suptitle(
+        "Fallback Impact: Does Adaptive Retrieval Help?",
+        fontsize=14,
+        fontweight="bold",
+        y=1.02,
+    )
+    plt.tight_layout()
+    path = output_dir / "fallback_impact.png"
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    logger.info(f"Saved: {path}")
+    plt.close()
+
+
+def plot_latency_comparison(
+    linear_results: List[Dict],
+    adaptive_results: List[Dict],
+    adaptive_web_results: List[Dict],
+    output_dir: Path,
+) -> None:
+    """Plot 5: Latency box plot across 3 configs with web search annotation.
+
+    Args:
+        linear_results: Per-query linear baseline results.
+        adaptive_results: Per-query adaptive results.
+        adaptive_web_results: Per-query adaptive+web results.
+        output_dir: Directory to save the plot.
+    """
+    lin_lat = [r["latency_s"] for r in linear_results]
+    adp_lat = [r["latency_s"] for r in adaptive_results]
+    web_lat = [r["latency_s"] for r in adaptive_web_results]
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    bp = ax.boxplot(
+        [lin_lat, adp_lat, web_lat],
+        tick_labels=["Linear", "Adaptive", "Adaptive+Web"],
+        patch_artist=True,
+        widths=0.5,
+        showmeans=True,
+        meanprops=dict(marker="D", markerfacecolor="white", markeredgecolor="black", markersize=7),
+    )
+
+    colors = [COLOR_LINEAR, COLOR_ADAPTIVE, COLOR_WEB]
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    # Mean annotations
+    for i, (data, _label) in enumerate(
+        [(lin_lat, "Linear"), (adp_lat, "Adaptive"), (web_lat, "Adpt+Web")]
+    ):
+        mean_val = float(np.mean(data))
+        ax.text(
+            i + 1,
+            mean_val + 0.3,
+            f"{mean_val:.1f}s",
+            ha="center",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+    # Web search stats
+    web_triggered = [r for r in adaptive_web_results if r.get("used_web_search", False)]
+    web_not_triggered = [r for r in adaptive_web_results if not r.get("used_web_search", False)]
+    web_rate = len(web_triggered) / len(adaptive_web_results) if adaptive_web_results else 0
+
+    if web_triggered and web_not_triggered:
+        web_overhead = float(np.mean([r["latency_s"] for r in web_triggered])) - float(
+            np.mean([r["latency_s"] for r in web_not_triggered])
+        )
+        stats_text = (
+            f"Web search rate: {web_rate:.0%}\n"
+            f"Web overhead: +{web_overhead:.1f}s\n"
+            f"(per triggered query)"
+        )
+    else:
+        stats_text = f"Web search rate: {web_rate:.0%}"
+
+    ax.text(
+        0.97,
+        0.95,
+        stats_text,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+    )
+
+    ax.set_ylabel("Latency (seconds)", fontsize=12)
+    ax.set_title(
+        "Latency Comparison Across Configurations",
+        fontsize=14,
+        fontweight="bold",
+    )
+    ax.grid(True, axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    path = output_dir / "latency_comparison.png"
     plt.savefig(path, dpi=300, bbox_inches="tight")
     logger.info(f"Saved: {path}")
     plt.close()
 
 
 def main():
-    """Load results and generate all 3 comparison plots."""
+    """Load results and generate all 5 comparison plots."""
     logger.info("=" * 60)
-    logger.info("AGENTIC RAG - Comparison Visualizations")
+    logger.info("AGENTIC RAG - 3-Config Ablation Visualizations")
     logger.info("=" * 60)
 
     if not INPUT_DIR.exists():
@@ -332,20 +596,28 @@ def main():
         )
         return
 
-    comparison, linear_results, agentic_results = load_results()
-    logger.info(f"Loaded results: {len(linear_results)} linear, " f"{len(agentic_results)} agentic")
+    comparison, linear_results, adaptive_results, adaptive_web_results = load_results()
+    logger.info(
+        f"Loaded: {len(linear_results)} linear, "
+        f"{len(adaptive_results)} adaptive, "
+        f"{len(adaptive_web_results)} adaptive+web"
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     plot_metrics_comparison(comparison, OUTPUT_DIR)
-    plot_retry_distribution(agentic_results, OUTPUT_DIR)
-    plot_f1_vs_retries(linear_results, agentic_results, OUTPUT_DIR)
+    plot_rerank_score_distribution(adaptive_results, OUTPUT_DIR)
+    plot_f1_delta_by_fallback(linear_results, adaptive_results, OUTPUT_DIR)
+    plot_fallback_impact(linear_results, adaptive_results, OUTPUT_DIR)
+    plot_latency_comparison(linear_results, adaptive_results, adaptive_web_results, OUTPUT_DIR)
 
     logger.info("")
-    logger.info("All plots saved to outputs/agentic_eval/:")
-    logger.info("  - metrics_comparison.png")
-    logger.info("  - retry_distribution.png")
-    logger.info("  - f1_vs_retries.png")
+    logger.info(f"All plots saved to {OUTPUT_DIR}/:")
+    logger.info("  - metrics_comparison.png       (3-config metrics bar chart)")
+    logger.info("  - rerank_score_distribution.png (score histogram + fallback)")
+    logger.info("  - f1_delta_by_fallback.png      (per-query F1 delta scatter)")
+    logger.info("  - fallback_impact.png           (F1 + faithfulness breakdown)")
+    logger.info("  - latency_comparison.png        (latency box plot)")
     logger.info("=" * 60)
 
 

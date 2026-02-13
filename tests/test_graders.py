@@ -1,9 +1,10 @@
 """
-Unit tests for document grading and query rewriting module.
+Unit tests for document grading, query rewriting, and answer grading module.
 
 Tests:
 - DocumentGrader: single and batch grading with parsing edge cases
 - QueryRewriter: query rewriting with output cleaning
+- AnswerGrader: answer quality grading with yes/no parsing
 - Fallback behavior for ambiguous or malformed LLM responses
 
 Note: Uses mocking to avoid loading LLM models in tests.
@@ -13,7 +14,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from src.graders import DocumentGrader, QueryRewriter
+from src.graders import AnswerGrader, DocumentGrader, QueryRewriter
 
 
 def create_mock_generator(max_new_tokens: int = 256) -> MagicMock:
@@ -577,6 +578,177 @@ class TestDocumentGraderPrompts:
         assert "{query}" in QueryRewriter.REWRITE_PROMPT
         assert "{num_total}" in QueryRewriter.REWRITE_PROMPT
         assert "{num_relevant}" in QueryRewriter.REWRITE_PROMPT
+
+
+# ===== AnswerGrader Tests =====
+
+
+class TestAnswerGrader:
+    """Tests for AnswerGrader.grade()."""
+
+    @pytest.fixture
+    def grader(self):
+        """Create an AnswerGrader with mocked generator."""
+        generator = create_mock_generator()
+        return AnswerGrader(generator)
+
+    def test_acceptable_answer(self, grader):
+        """'yes' response should return True."""
+        grader.generator._generate_text.return_value = "yes"
+        assert grader.grade("When was Beyonce born?", "1981.", ["Born in 1981."]) is True
+
+    def test_unacceptable_answer(self, grader):
+        """'no' response should return False."""
+        grader.generator._generate_text.return_value = "no"
+        assert grader.grade("When was Beyonce born?", "Paris.", ["Born in 1981."]) is False
+
+    def test_empty_answer_returns_false(self, grader):
+        """Empty answer should return False without calling LLM."""
+        assert grader.grade("query", "", ["doc"]) is False
+        grader.generator._generate_text.assert_not_called()
+
+    def test_whitespace_answer_returns_false(self, grader):
+        """Whitespace-only answer should return False without calling LLM."""
+        assert grader.grade("query", "   ", ["doc"]) is False
+        grader.generator._generate_text.assert_not_called()
+
+    def test_none_answer_returns_false(self, grader):
+        """None answer should return False without calling LLM."""
+        assert grader.grade("query", None, ["doc"]) is False
+        grader.generator._generate_text.assert_not_called()
+
+    def test_ambiguous_response_defaults_to_true(self, grader):
+        """Unparseable response should default to True (permissive)."""
+        grader.generator._generate_text.return_value = "maybe"
+        assert grader.grade("query", "answer", ["doc"]) is True
+
+    def test_empty_response_defaults_to_true(self, grader):
+        """Empty LLM response should default to True (permissive)."""
+        grader.generator._generate_text.return_value = ""
+        assert grader.grade("query", "answer", ["doc"]) is True
+
+    def test_yes_with_extra_text(self, grader):
+        """Response containing 'yes' among other text should return True."""
+        grader.generator._generate_text.return_value = "Yes, the answer is correct."
+        assert grader.grade("query", "answer", ["doc"]) is True
+
+    def test_no_with_extra_text(self, grader):
+        """Response containing 'no' (without 'yes') should return False."""
+        grader.generator._generate_text.return_value = "No, the answer is wrong."
+        assert grader.grade("query", "answer", ["doc"]) is False
+
+    def test_both_yes_and_no_defaults_to_yes(self, grader):
+        """If both 'yes' and 'no' appear, 'yes' wins (permissive)."""
+        grader.generator._generate_text.return_value = "yes, but also no"
+        assert grader.grade("query", "answer", ["doc"]) is True
+
+    def test_case_insensitive_yes(self, grader):
+        """'YES', 'Yes', 'yEs' should all return True."""
+        for variant in ["YES", "Yes", "yEs", "  yes  "]:
+            grader.generator._generate_text.return_value = variant
+            assert grader.grade("query", "answer", ["doc"]) is True
+
+    def test_case_insensitive_no(self, grader):
+        """'NO', 'No', 'nO' should all return False."""
+        for variant in ["NO", "No", "nO", "  no  "]:
+            grader.generator._generate_text.return_value = variant
+            assert grader.grade("query", "answer", ["doc"]) is False
+
+    def test_max_tokens_override_and_restore(self, grader):
+        """max_new_tokens should be temporarily set to 10 and then restored."""
+        grader.generator.max_new_tokens = 256
+
+        grader.grade("query", "answer", ["doc"])
+
+        assert grader.generator.max_new_tokens == 256
+
+    def test_max_tokens_restored_on_error(self, grader):
+        """max_new_tokens should be restored even if _generate_text raises."""
+        grader.generator.max_new_tokens = 256
+        grader.generator._generate_text.side_effect = RuntimeError("OOM")
+
+        with pytest.raises(RuntimeError):
+            grader.grade("query", "answer", ["doc"])
+
+        assert grader.generator.max_new_tokens == 256
+
+    def test_prompt_contains_query_answer_docs(self, grader):
+        """The prompt should contain the query, answer, and document text."""
+        grader.grade("test question", "test answer", ["context doc"])
+
+        call_args = grader.generator._generate_text.call_args[0][0]
+        assert "test question" in call_args
+        assert "test answer" in call_args
+        assert "context doc" in call_args
+
+    def test_document_truncation_in_prompt(self, grader):
+        """Documents longer than 500 chars should be truncated in the prompt."""
+        long_doc = "x" * 1000
+
+        grader.grade("query", "answer", [long_doc])
+
+        call_args = grader.generator._generate_text.call_args[0][0]
+        assert "x" * 500 in call_args
+        assert "x" * 1000 not in call_args
+
+    def test_multiple_documents(self, grader):
+        """Multiple documents should all appear in the prompt."""
+        grader.grade("query", "answer", ["doc A", "doc B", "doc C"])
+
+        call_args = grader.generator._generate_text.call_args[0][0]
+        assert "doc A" in call_args
+        assert "doc B" in call_args
+        assert "doc C" in call_args
+
+    def test_empty_documents_list(self, grader):
+        """Empty documents list should still work."""
+        grader.generator._generate_text.return_value = "yes"
+        assert grader.grade("query", "answer", []) is True
+
+
+class TestAnswerGraderPrompt:
+    """Tests for AnswerGrader prompt template."""
+
+    def test_prompt_has_required_placeholders(self):
+        """Prompt must contain {query}, {answer}, {documents}."""
+        assert "{query}" in AnswerGrader.GRADING_PROMPT
+        assert "{answer}" in AnswerGrader.GRADING_PROMPT
+        assert "{documents}" in AnswerGrader.GRADING_PROMPT
+
+    def test_prompt_instructs_binary_response(self):
+        """Prompt should instruct LLM to respond with yes or no."""
+        prompt_lower = AnswerGrader.GRADING_PROMPT.lower()
+        assert "yes" in prompt_lower
+        assert "no" in prompt_lower
+
+
+class TestAnswerGraderParsing:
+    """Tests for AnswerGrader._parse_grade() internal method."""
+
+    @pytest.fixture
+    def grader(self):
+        generator = create_mock_generator()
+        return AnswerGrader(generator)
+
+    def test_parse_yes(self, grader):
+        assert grader._parse_grade("yes") is True
+
+    def test_parse_no(self, grader):
+        assert grader._parse_grade("no") is False
+
+    def test_parse_whitespace(self, grader):
+        assert grader._parse_grade("  yes  ") is True
+        assert grader._parse_grade("  no  ") is False
+
+    def test_parse_mixed_case(self, grader):
+        assert grader._parse_grade("YES") is True
+        assert grader._parse_grade("NO") is False
+
+    def test_parse_ambiguous_defaults_true(self, grader):
+        assert grader._parse_grade("uncertain") is True
+
+    def test_parse_empty_defaults_true(self, grader):
+        assert grader._parse_grade("") is True
 
 
 if __name__ == "__main__":

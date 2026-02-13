@@ -1,16 +1,15 @@
 """
-Unit tests for the agentic RAG pipeline.
+Unit tests for the agentic RAG pipeline (v3: adaptive retrieval + answer grading).
 
 Tests:
 - RAGState initialization and structure
 - Individual node behavior with mocked components
 - Graph compilation and structure
-- Intermediate steps accumulation across nodes
+- Feature flags (adaptive retrieval, answer grading, rerank threshold)
+- Conditional routing (_decide_retrieval_quality, _decide_after_grading)
+- Retry generation with stricter prompt
 - query() method output format
-- Fallback behavior when grading filters all documents
-- Conditional routing (_decide_to_generate)
-- Query rewriting node
-- Retry loop integration
+- Configurations: Linear, Adaptive, AnswerGrading, Full
 
 Note: Uses mocking to avoid loading models or LangGraph execution overhead.
 """
@@ -27,9 +26,8 @@ def create_mock_components():
     retriever = MagicMock()
     reranker = MagicMock()
     generator = MagicMock()
-    grader = MagicMock()
-    query_rewriter = MagicMock()
-    return retriever, reranker, generator, grader, query_rewriter
+    answer_grader = MagicMock()
+    return retriever, reranker, generator, answer_grader
 
 
 def make_doc(content: str, doc_id: str = "doc1", score: float = 0.9) -> dict:
@@ -39,6 +37,7 @@ def make_doc(content: str, doc_id: str = "doc1", score: float = 0.9) -> dict:
         "doc_id": doc_id,
         "chunk_id": f"{doc_id}_0",
         "score": score,
+        "rerank_score": score,
         "chunk_index": 0,
         "metadata": {},
     }
@@ -48,13 +47,13 @@ def make_state(**overrides) -> RAGState:
     """Create a RAGState with defaults, overriding specified fields."""
     state = {
         "query": "test query",
-        "rewritten_query": "",
-        "query_history": [],
         "documents": [],
-        "graded_documents": [],
-        "document_grades": [],
         "generation": "",
         "retry_count": 0,
+        "min_rerank_score": 0.0,
+        "used_fallback_retrieval": False,
+        "used_web_search": False,
+        "answer_is_acceptable": True,
         "intermediate_steps": [],
     }
     state.update(overrides)
@@ -68,34 +67,33 @@ class TestRAGState:
         """RAGState should accept all required fields."""
         state = make_state()
         assert state["query"] == "test query"
-        assert state["rewritten_query"] == ""
-        assert state["query_history"] == []
         assert state["documents"] == []
-        assert state["graded_documents"] == []
-        assert state["document_grades"] == []
         assert state["generation"] == ""
         assert state["retry_count"] == 0
+        assert state["min_rerank_score"] == 0.0
+        assert state["used_fallback_retrieval"] is False
+        assert state["used_web_search"] is False
+        assert state["answer_is_acceptable"] is True
         assert state["intermediate_steps"] == []
 
     def test_state_with_populated_fields(self):
-        """RAGState should hold populated data including retry fields."""
+        """RAGState should hold populated data."""
         docs = [make_doc("content 1"), make_doc("content 2")]
         state = make_state(
             query="When was Beyonce born?",
-            rewritten_query="Beyonce birth year date",
-            query_history=["Beyonce birth year date"],
             documents=docs,
-            graded_documents=[docs[0]],
-            document_grades=[True, False],
             generation="Beyonce was born in 1981.",
             retry_count=1,
-            intermediate_steps=["Retrieved 2 docs", "Graded: 1/2 relevant"],
+            min_rerank_score=2.5,
+            used_fallback_retrieval=True,
+            answer_is_acceptable=False,
+            intermediate_steps=["Retrieved 2 docs", "Generated answer"],
         )
         assert len(state["documents"]) == 2
-        assert len(state["graded_documents"]) == 1
         assert state["retry_count"] == 1
-        assert state["rewritten_query"] == "Beyonce birth year date"
-        assert len(state["query_history"]) == 1
+        assert state["min_rerank_score"] == 2.5
+        assert state["used_fallback_retrieval"] is True
+        assert state["answer_is_acceptable"] is False
 
 
 class TestPipelineInit:
@@ -103,96 +101,214 @@ class TestPipelineInit:
 
     def test_init_stores_components(self):
         """Pipeline should store all component references."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+        retriever, reranker, generator, answer_grader = create_mock_components()
 
         pipeline = AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
         )
 
         assert pipeline.retriever is retriever
         assert pipeline.reranker is reranker
         assert pipeline.generator is generator
-        assert pipeline.grader is grader
-        assert pipeline.query_rewriter is rewriter
+        assert pipeline.answer_grader is answer_grader
 
-    def test_init_default_k_values(self):
-        """Default k_retrieve=20, k_rerank=10."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+    def test_init_default_values(self):
+        """Default k_retrieve=20, k_rerank=5, max_retries=1."""
+        retriever, reranker, generator, _ = create_mock_components()
 
         pipeline = AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
         )
 
         assert pipeline.k_retrieve == 20
         assert pipeline.k_rerank == 5
+        assert pipeline.max_retries == 1
 
-    def test_init_default_retry_values(self):
-        """Default min_relevant=3, max_retries=3."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+    def test_init_default_feature_flags(self):
+        """Default: all features disabled (linear mode)."""
+        retriever, reranker, generator, _ = create_mock_components()
 
         pipeline = AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
         )
 
-        assert pipeline.min_relevant == 3
-        assert pipeline.max_retries == 3
+        assert pipeline.enable_adaptive_retrieval is False
+        assert pipeline.enable_web_search is False
+        assert pipeline.enable_answer_grading is False
+        assert pipeline.enable_rerank_threshold is False
 
-    def test_init_custom_k_values(self):
-        """Custom k values should be stored."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+    def test_init_custom_values(self):
+        """Custom k and retry values should be stored."""
+        retriever, reranker, generator, answer_grader = create_mock_components()
 
         pipeline = AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
             k_retrieve=30,
-            k_rerank=5,
-        )
-
-        assert pipeline.k_retrieve == 30
-        assert pipeline.k_rerank == 5
-
-    def test_init_custom_retry_values(self):
-        """Custom retry values should be stored."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
-
-        pipeline = AgenticRAGPipeline(
-            hybrid_retriever=retriever,
-            reranker=reranker,
-            generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
-            min_relevant=5,
+            k_rerank=10,
             max_retries=2,
         )
 
-        assert pipeline.min_relevant == 5
+        assert pipeline.k_retrieve == 30
+        assert pipeline.k_rerank == 10
         assert pipeline.max_retries == 2
 
-    def test_graph_compiles(self):
-        """_build_graph() should produce a compiled graph."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+    def test_init_linear_mode(self):
+        """Linear mode: no grader or fallback needed when all disabled."""
+        retriever, reranker, generator, _ = create_mock_components()
 
         pipeline = AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
+        )
+
+        assert pipeline.answer_grader is None
+        assert pipeline.fallback_retriever is retriever  # defaults to primary
+
+    def test_init_raises_without_grader(self):
+        """Should raise ValueError when grading enabled but no grader."""
+        retriever, reranker, generator, _ = create_mock_components()
+
+        with pytest.raises(ValueError, match="answer_grader is required"):
+            AgenticRAGPipeline(
+                hybrid_retriever=retriever,
+                reranker=reranker,
+                generator=generator,
+                enable_answer_grading=True,
+            )
+
+    def test_init_adaptive_defaults_fallback_to_primary(self):
+        """Adaptive without explicit fallback should use primary retriever."""
+        retriever, reranker, generator, _ = create_mock_components()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            enable_adaptive_retrieval=True,
+        )
+        assert pipeline.fallback_retriever is retriever
+
+    def test_init_web_search_creates_default_tool(self):
+        """Web search enabled without tool should create default DuckDuckGoSearchTool."""
+        retriever, reranker, generator, _ = create_mock_components()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            enable_web_search=True,
+        )
+
+        assert pipeline.web_search_tool is not None
+        assert pipeline.enable_web_search is True
+
+    def test_init_web_search_uses_provided_tool(self):
+        """Web search enabled with explicit tool should use it."""
+        retriever, reranker, generator, _ = create_mock_components()
+        web_tool = MagicMock()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            web_search_tool=web_tool,
+            enable_web_search=True,
+        )
+
+        assert pipeline.web_search_tool is web_tool
+
+    def test_init_web_search_disabled_no_default_tool(self):
+        """Web search disabled should not create a tool."""
+        retriever, reranker, generator, _ = create_mock_components()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+        )
+
+        assert pipeline.web_search_tool is None
+
+    def test_graph_compiles(self):
+        """_build_graph() should produce a compiled graph."""
+        retriever, reranker, generator, answer_grader = create_mock_components()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+        )
+
+        assert pipeline.app is not None
+
+    def test_graph_compiles_linear(self):
+        """Linear graph should compile without extra nodes."""
+        retriever, reranker, generator, _ = create_mock_components()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+        )
+
+        assert pipeline.app is not None
+
+    def test_graph_compiles_adaptive(self):
+        """Adaptive graph should compile with fallback_retrieve node."""
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+        )
+
+        assert pipeline.app is not None
+        assert pipeline.fallback_retriever is fallback
+
+    def test_graph_compiles_web_search(self):
+        """Web search graph should compile with check_web and web_search nodes."""
+        retriever, reranker, generator, _ = create_mock_components()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            enable_web_search=True,
+        )
+
+        assert pipeline.app is not None
+
+    def test_graph_compiles_adaptive_plus_web_search(self):
+        """Adaptive + web search graph should compile."""
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+            enable_web_search=True,
         )
 
         assert pipeline.app is not None
@@ -203,22 +319,20 @@ class TestRetrieveNode:
 
     @pytest.fixture
     def pipeline(self):
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+        retriever, reranker, generator, _ = create_mock_components()
         retriever.search.return_value = [
             make_doc("doc A", "a"),
             make_doc("doc B", "b"),
             make_doc("doc C", "c"),
         ]
         reranker.rerank.return_value = [
-            make_doc("doc A", "a"),
-            make_doc("doc B", "b"),
+            make_doc("doc A", "a", 3.5),
+            make_doc("doc B", "b", 1.2),
         ]
         return AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
             k_retrieve=20,
             k_rerank=2,
         )
@@ -231,29 +345,19 @@ class TestRetrieveNode:
         assert len(result["documents"]) == 2
         assert result["documents"][0]["doc_id"] == "a"
 
+    def test_computes_min_rerank_score(self, pipeline):
+        """Node should compute min rerank score from documents."""
+        state = make_state(query="test query")
+        result = pipeline._retrieve_node(state)
+
+        assert result["min_rerank_score"] == 1.2
+
     def test_calls_retriever_with_correct_k(self, pipeline):
         """Retriever should be called with k_retrieve and k_retriever=50."""
         state = make_state(query="test query")
         pipeline._retrieve_node(state)
 
         pipeline.retriever.search.assert_called_once_with("test query", k=20, k_retriever=50)
-
-    def test_uses_rewritten_query_on_retry(self, pipeline):
-        """On retry, should use rewritten_query instead of original."""
-        state = make_state(
-            query="original query",
-            rewritten_query="better query",
-        )
-        pipeline._retrieve_node(state)
-
-        pipeline.retriever.search.assert_called_once_with("better query", k=20, k_retriever=50)
-
-    def test_falls_back_to_original_when_no_rewrite(self, pipeline):
-        """With empty rewritten_query, should use original query."""
-        state = make_state(query="original query", rewritten_query="")
-        pipeline._retrieve_node(state)
-
-        pipeline.retriever.search.assert_called_once_with("original query", k=20, k_retriever=50)
 
     def test_calls_reranker_with_correct_top_k(self, pipeline):
         """Reranker should be called with k_rerank as top_k."""
@@ -273,301 +377,310 @@ class TestRetrieveNode:
         assert "Retrieved" in result["intermediate_steps"][0]
         assert "2" in result["intermediate_steps"][0]
 
+    def test_empty_reranked_defaults_min_score_zero(self, pipeline):
+        """Empty reranked list should default min_rerank_score to 0.0."""
+        pipeline.reranker.rerank.return_value = []
+        state = make_state(query="test query")
+        result = pipeline._retrieve_node(state)
 
-class TestGradeDocumentsNode:
-    """Tests for _grade_documents_node."""
+        assert result["min_rerank_score"] == 0.0
+
+
+class TestDecideRetrievalQuality:
+    """Tests for _decide_retrieval_quality routing logic."""
 
     @pytest.fixture
     def pipeline(self):
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
-        grader.grade_batch.return_value = [True, False, True]
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
         return AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+            retrieval_threshold=0.0,
         )
 
-    def test_filters_irrelevant_documents(self, pipeline):
-        """Only documents graded True should remain."""
-        docs = [make_doc("relevant A"), make_doc("irrelevant B"), make_doc("relevant C")]
-        state = make_state(query="test query", documents=docs)
+    def test_acceptable_when_above_threshold(self, pipeline):
+        """Good rerank scores should route to generate."""
+        state = make_state(min_rerank_score=2.0)
+        assert pipeline._decide_retrieval_quality(state) == "acceptable"
 
-        result = pipeline._grade_documents_node(state)
+    def test_fallback_when_below_threshold(self, pipeline):
+        """Poor rerank scores should route to fallback retrieval."""
+        state = make_state(min_rerank_score=-3.0)
+        assert pipeline._decide_retrieval_quality(state) == "fallback"
 
-        assert len(result["graded_documents"]) == 2
-        assert result["graded_documents"][0]["content"] == "relevant A"
-        assert result["graded_documents"][1]["content"] == "relevant C"
+    def test_acceptable_at_exact_threshold(self, pipeline):
+        """Score equal to threshold should be acceptable (>= check)."""
+        state = make_state(min_rerank_score=0.0)
+        assert pipeline._decide_retrieval_quality(state) == "acceptable"
 
-    def test_returns_document_grades(self, pipeline):
-        """Node should return raw boolean grades for transparency."""
-        docs = [make_doc("A"), make_doc("B"), make_doc("C")]
-        state = make_state(query="test query", documents=docs)
+    def test_fallback_just_below_threshold(self, pipeline):
+        """Score just below threshold should trigger fallback."""
+        state = make_state(min_rerank_score=-0.001)
+        assert pipeline._decide_retrieval_quality(state) == "fallback"
 
-        result = pipeline._grade_documents_node(state)
-
-        assert result["document_grades"] == [True, False, True]
-
-    def test_calls_grader_with_doc_contents(self, pipeline):
-        """Grader should receive document content strings, not full dicts."""
-        docs = [make_doc("content A"), make_doc("content B"), make_doc("content C")]
-        state = make_state(query="test query", documents=docs)
-
-        pipeline._grade_documents_node(state)
-
-        pipeline.grader.grade_batch.assert_called_once_with(
-            "test query", ["content A", "content B", "content C"]
-        )
-
-    def test_all_relevant(self, pipeline):
-        """When all docs are relevant, all should pass through."""
-        pipeline.grader.grade_batch.return_value = [True, True]
-        docs = [make_doc("A"), make_doc("B")]
-        state = make_state(query="q", documents=docs)
-
-        result = pipeline._grade_documents_node(state)
-
-        assert len(result["graded_documents"]) == 2
-
-    def test_all_irrelevant(self, pipeline):
-        """When all docs are irrelevant, graded list should be empty."""
-        pipeline.grader.grade_batch.return_value = [False, False, False]
-        docs = [make_doc("A"), make_doc("B"), make_doc("C")]
-        state = make_state(query="q", documents=docs)
-
-        result = pipeline._grade_documents_node(state)
-
-        assert len(result["graded_documents"]) == 0
-
-    def test_logs_intermediate_step(self, pipeline):
-        """Node should log how many docs passed grading."""
-        docs = [make_doc("A"), make_doc("B"), make_doc("C")]
-        state = make_state(query="q", documents=docs)
-
-        result = pipeline._grade_documents_node(state)
-
-        assert len(result["intermediate_steps"]) == 1
-        assert "2/3" in result["intermediate_steps"][0]
-
-
-class TestDecideToGenerate:
-    """Tests for _decide_to_generate routing logic."""
-
-    @pytest.fixture
-    def pipeline(self):
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
-        return AgenticRAGPipeline(
-            hybrid_retriever=retriever,
-            reranker=reranker,
-            generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
-            min_relevant=3,
-            max_retries=3,
-        )
-
-    def test_generate_when_enough_relevant(self, pipeline):
-        """Should route to generate when >= min_relevant docs."""
-        graded = [make_doc("A"), make_doc("B"), make_doc("C")]
-        state = make_state(graded_documents=graded, retry_count=0)
-
-        assert pipeline._decide_to_generate(state) == "generate"
-
-    def test_generate_when_more_than_enough(self, pipeline):
-        """Should route to generate when well above threshold."""
-        graded = [make_doc(f"d{i}") for i in range(8)]
-        state = make_state(graded_documents=graded, retry_count=0)
-
-        assert pipeline._decide_to_generate(state) == "generate"
-
-    def test_rewrite_when_too_few_relevant(self, pipeline):
-        """Should route to rewrite when < min_relevant and retries left."""
-        graded = [make_doc("A")]
-        state = make_state(graded_documents=graded, retry_count=0)
-
-        assert pipeline._decide_to_generate(state) == "rewrite"
-
-    def test_rewrite_when_zero_relevant(self, pipeline):
-        """Should route to rewrite when no docs are relevant."""
-        state = make_state(graded_documents=[], retry_count=0)
-
-        assert pipeline._decide_to_generate(state) == "rewrite"
-
-    def test_generate_at_max_retries(self, pipeline):
-        """Should generate when max retries reached, even with few docs."""
-        graded = [make_doc("A")]
-        state = make_state(graded_documents=graded, retry_count=3)
-
-        assert pipeline._decide_to_generate(state) == "generate"
-
-    def test_generate_past_max_retries(self, pipeline):
-        """Should generate when past max retries."""
-        state = make_state(graded_documents=[], retry_count=5)
-
-        assert pipeline._decide_to_generate(state) == "generate"
-
-    def test_generate_on_query_loop(self, pipeline):
-        """Should generate when rewrite produces same query twice."""
-        state = make_state(
-            graded_documents=[make_doc("A")],
-            retry_count=1,
-            query_history=["better query", "better query"],
-        )
-
-        assert pipeline._decide_to_generate(state) == "generate"
-
-    def test_rewrite_when_queries_differ(self, pipeline):
-        """Should rewrite when query history shows different queries."""
-        state = make_state(
-            graded_documents=[make_doc("A")],
-            retry_count=1,
-            query_history=["query v1", "query v2"],
-        )
-
-        assert pipeline._decide_to_generate(state) == "rewrite"
-
-    def test_rewrite_with_single_history_entry(self, pipeline):
-        """With only 1 history entry, loop detection shouldn't trigger."""
-        state = make_state(
-            graded_documents=[make_doc("A")],
-            retry_count=1,
-            query_history=["better query"],
-        )
-
-        assert pipeline._decide_to_generate(state) == "rewrite"
-
-    def test_generate_threshold_exactly_at_min(self, pipeline):
-        """Exactly min_relevant docs should route to generate."""
-        graded = [make_doc("A"), make_doc("B"), make_doc("C")]
-        state = make_state(graded_documents=graded, retry_count=0)
-
-        assert pipeline._decide_to_generate(state) == "generate"
-
-    def test_rewrite_threshold_one_below_min(self, pipeline):
-        """One below min_relevant should route to rewrite."""
-        graded = [make_doc("A"), make_doc("B")]
-        state = make_state(graded_documents=graded, retry_count=0)
-
-        assert pipeline._decide_to_generate(state) == "rewrite"
-
-    def test_custom_min_relevant(self):
-        """Custom min_relevant should be respected."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+    def test_custom_threshold(self):
+        """Custom threshold value should be used for routing."""
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
         pipeline = AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
-            min_relevant=5,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+            retrieval_threshold=2.0,
         )
 
-        graded = [make_doc(f"d{i}") for i in range(4)]
-        state = make_state(graded_documents=graded, retry_count=0)
+        # 1.5 < 2.0 → fallback
+        state = make_state(min_rerank_score=1.5)
+        assert pipeline._decide_retrieval_quality(state) == "fallback"
 
-        assert pipeline._decide_to_generate(state) == "rewrite"
+        # 3.0 >= 2.0 → acceptable
+        state = make_state(min_rerank_score=3.0)
+        assert pipeline._decide_retrieval_quality(state) == "acceptable"
 
-    def test_custom_max_retries(self):
-        """Custom max_retries should be respected."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+    def test_negative_threshold(self):
+        """Negative threshold should still work correctly."""
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
         pipeline = AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
-            max_retries=1,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+            retrieval_threshold=-5.0,
         )
 
-        state = make_state(graded_documents=[], retry_count=1)
+        # -3.0 >= -5.0 → acceptable
+        state = make_state(min_rerank_score=-3.0)
+        assert pipeline._decide_retrieval_quality(state) == "acceptable"
 
-        assert pipeline._decide_to_generate(state) == "generate"
+        # -6.0 < -5.0 → fallback
+        state = make_state(min_rerank_score=-6.0)
+        assert pipeline._decide_retrieval_quality(state) == "fallback"
 
 
-class TestRewriteQueryNode:
-    """Tests for _rewrite_query_node."""
+class TestFallbackRetrieveNode:
+    """Tests for _fallback_retrieve_node."""
 
     @pytest.fixture
     def pipeline(self):
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
-        rewriter.rewrite.return_value = "Beyonce birth year date"
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
+        fallback.search.return_value = [
+            make_doc("fallback A", "fa"),
+            make_doc("fallback B", "fb"),
+        ]
+        reranker.rerank.return_value = [
+            make_doc("fallback A", "fa", 2.0),
+            make_doc("fallback B", "fb", 0.5),
+        ]
         return AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
         )
 
-    def test_returns_rewritten_query(self, pipeline):
-        """Node should return the new rewritten query."""
-        state = make_state(query="When was she born?")
+    def test_uses_fallback_retriever(self, pipeline):
+        """Should call fallback_retriever, not primary retriever."""
+        state = make_state(query="test query")
+        pipeline._fallback_retrieve_node(state)
 
-        result = pipeline._rewrite_query_node(state)
+        pipeline.fallback_retriever.search.assert_called_once()
+        pipeline.retriever.search.assert_not_called()
 
-        assert result["rewritten_query"] == "Beyonce birth year date"
+    def test_returns_reranked_documents(self, pipeline):
+        """Should return fallback-retrieved and reranked documents."""
+        state = make_state(query="test query")
+        result = pipeline._fallback_retrieve_node(state)
 
-    def test_increments_retry_count(self, pipeline):
-        """retry_count should increase by 1."""
-        state = make_state(retry_count=0)
+        assert len(result["documents"]) == 2
+        assert result["documents"][0]["doc_id"] == "fa"
 
-        result = pipeline._rewrite_query_node(state)
+    def test_sets_fallback_flag(self, pipeline):
+        """Should set used_fallback_retrieval to True."""
+        state = make_state(query="test query")
+        result = pipeline._fallback_retrieve_node(state)
 
-        assert result["retry_count"] == 1
+        assert result["used_fallback_retrieval"] is True
 
-    def test_increments_from_existing_count(self, pipeline):
-        """retry_count should build on existing value."""
-        state = make_state(retry_count=2)
+    def test_computes_min_rerank_score(self, pipeline):
+        """Should compute min rerank score from fallback docs."""
+        state = make_state(query="test query")
+        result = pipeline._fallback_retrieve_node(state)
 
-        result = pipeline._rewrite_query_node(state)
+        assert result["min_rerank_score"] == 0.5
 
-        assert result["retry_count"] == 3
+    def test_logs_fallback_step(self, pipeline):
+        """Intermediate step should mention 'Fallback'."""
+        state = make_state(query="test query")
+        result = pipeline._fallback_retrieve_node(state)
 
-    def test_appends_to_query_history(self, pipeline):
-        """New query should be appended to history."""
+        assert "Fallback" in result["intermediate_steps"][0]
+
+    def test_calls_fallback_with_wider_k(self, pipeline):
+        """Fallback retriever should use wider k (2x primary by default)."""
+        state = make_state(query="test query")
+        pipeline._fallback_retrieve_node(state)
+
+        pipeline.fallback_retriever.search.assert_called_once_with(
+            "test query", k=40, k_retriever=100
+        )
+
+
+class TestCheckWebNode:
+    """Tests for _check_web_node passthrough."""
+
+    @pytest.fixture
+    def pipeline(self):
+        retriever, reranker, generator, _ = create_mock_components()
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            enable_web_search=True,
+        )
+
+    def test_returns_empty_dict(self, pipeline):
+        """Passthrough node should return empty dict (no state updates)."""
         state = make_state()
+        result = pipeline._check_web_node(state)
+        assert result == {}
 
-        result = pipeline._rewrite_query_node(state)
 
-        assert result["query_history"] == ["Beyonce birth year date"]
+class TestDecideWebSearch:
+    """Tests for _decide_web_search routing logic."""
 
-    def test_calls_rewriter_with_stats(self, pipeline):
-        """Rewriter should receive current query and retrieval stats."""
-        docs = [make_doc("A"), make_doc("B"), make_doc("C")]
-        graded = [make_doc("A")]
-        state = make_state(
-            query="original query",
-            documents=docs,
-            graded_documents=graded,
+    @pytest.fixture
+    def pipeline(self):
+        retriever, reranker, generator, _ = create_mock_components()
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            enable_web_search=True,
+            web_search_threshold=-5.0,
         )
 
-        pipeline._rewrite_query_node(state)
+    def test_skip_when_above_threshold(self, pipeline):
+        """Good rerank scores should skip web search."""
+        state = make_state(min_rerank_score=2.0)
+        assert pipeline._decide_web_search(state) == "skip_web"
 
-        pipeline.query_rewriter.rewrite.assert_called_once_with("original query", 3, 1)
+    def test_web_search_when_below_threshold(self, pipeline):
+        """Very poor rerank scores should trigger web search."""
+        state = make_state(min_rerank_score=-7.0)
+        assert pipeline._decide_web_search(state) == "web_search"
 
-    def test_always_rewrites_from_original_query(self, pipeline):
-        """On subsequent retries, should rewrite from original query (not previous rewrite)."""
-        state = make_state(
-            query="original query",
-            rewritten_query="already rewritten",
-            documents=[make_doc("A")],
-            graded_documents=[],
+    def test_skip_at_exact_threshold(self, pipeline):
+        """Score equal to threshold should skip (>= check)."""
+        state = make_state(min_rerank_score=-5.0)
+        assert pipeline._decide_web_search(state) == "skip_web"
+
+    def test_web_search_just_below_threshold(self, pipeline):
+        """Score just below threshold should trigger web search."""
+        state = make_state(min_rerank_score=-5.001)
+        assert pipeline._decide_web_search(state) == "web_search"
+
+    def test_custom_threshold(self):
+        """Custom web_search_threshold should be used for routing."""
+        retriever, reranker, generator, _ = create_mock_components()
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            enable_web_search=True,
+            web_search_threshold=0.0,
         )
 
-        pipeline._rewrite_query_node(state)
+        state = make_state(min_rerank_score=-0.5)
+        assert pipeline._decide_web_search(state) == "web_search"
 
-        pipeline.query_rewriter.rewrite.assert_called_once_with("original query", 1, 0)
+        state = make_state(min_rerank_score=1.0)
+        assert pipeline._decide_web_search(state) == "skip_web"
+
+    def test_default_inf_skips_web(self, pipeline):
+        """Missing min_rerank_score should default to inf (skip web)."""
+        state = {"query": "q", "intermediate_steps": []}
+        assert pipeline._decide_web_search(state) == "skip_web"
+
+
+class TestWebSearchNode:
+    """Tests for _web_search_node."""
+
+    @pytest.fixture
+    def pipeline(self):
+        retriever, reranker, generator, _ = create_mock_components()
+        web_tool = MagicMock()
+        web_tool.search.return_value = [
+            {"content": "Web result 1", "source": "https://example.com/1"},
+            {"content": "Web result 2", "source": "https://example.com/2"},
+        ]
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            web_search_tool=web_tool,
+            enable_web_search=True,
+        )
+
+    def test_calls_web_search_tool(self, pipeline):
+        """Should call web_search_tool.search with the query."""
+        state = make_state(query="test query")
+        pipeline._web_search_node(state)
+
+        pipeline.web_search_tool.search.assert_called_once_with("test query")
+
+    def test_merges_web_docs_with_existing(self, pipeline):
+        """Should merge web results with existing local documents."""
+        local_docs = [make_doc("local A", "la")]
+        state = make_state(query="test query", documents=local_docs)
+        result = pipeline._web_search_node(state)
+
+        assert len(result["documents"]) == 3  # 1 local + 2 web
+        assert result["documents"][0]["doc_id"] == "la"
+        assert result["documents"][1]["content"] == "Web result 1"
+        assert result["documents"][2]["content"] == "Web result 2"
+
+    def test_sets_web_search_flag(self, pipeline):
+        """Should set used_web_search to True."""
+        state = make_state(query="test query")
+        result = pipeline._web_search_node(state)
+
+        assert result["used_web_search"] is True
 
     def test_logs_intermediate_step(self, pipeline):
-        """Node should log the rewrite action."""
-        state = make_state(query="original query")
-
-        result = pipeline._rewrite_query_node(state)
+        """Should log a step with result count."""
+        state = make_state(query="test query")
+        result = pipeline._web_search_node(state)
 
         assert len(result["intermediate_steps"]) == 1
-        assert "Rewrote" in result["intermediate_steps"][0]
-        assert "Beyonce birth year date" in result["intermediate_steps"][0]
+        assert "Web search" in result["intermediate_steps"][0]
+        assert "2" in result["intermediate_steps"][0]
+
+    def test_empty_web_results(self, pipeline):
+        """Should handle empty web results (still merges)."""
+        pipeline.web_search_tool.search.return_value = []
+        local_docs = [make_doc("local", "l")]
+        state = make_state(query="test query", documents=local_docs)
+        result = pipeline._web_search_node(state)
+
+        assert len(result["documents"]) == 1  # only local
+        assert result["used_web_search"] is True
+
+    def test_web_results_with_empty_local(self, pipeline):
+        """Should work when local docs are empty."""
+        state = make_state(query="test query", documents=[])
+        result = pipeline._web_search_node(state)
+
+        assert len(result["documents"]) == 2  # only web
 
 
 class TestGenerateNode:
@@ -575,124 +688,332 @@ class TestGenerateNode:
 
     @pytest.fixture
     def pipeline(self):
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+        retriever, reranker, generator, answer_grader = create_mock_components()
         generator.generate.return_value = {"answer": "Beyonce was born in 1981."}
+        generator._format_context.return_value = "[1] context text"
+        generator._generate_text.return_value = "Precise answer text."
+        generator._parse_answer.return_value = "Precise answer text."
         return AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
         )
 
-    def test_generates_from_all_reranked_docs(self, pipeline):
-        """Node should generate answer from all reranked documents, not just graded."""
+    def test_first_attempt_uses_standard_generate(self, pipeline):
+        """First attempt (retry_count=0) should use generator.generate()."""
         docs = [make_doc("d1"), make_doc("d2")]
-        graded = [make_doc("d1")]  # grading filtered one, but generate uses all
         state = make_state(
             query="When was Beyonce born?",
             documents=docs,
-            graded_documents=graded,
+            retry_count=0,
         )
 
         result = pipeline._generate_node(state)
 
         assert result["generation"] == "Beyonce was born in 1981."
-        # Verify all reranked docs were passed, not just graded
-        call_args = pipeline.generator.generate.call_args[0]
-        assert call_args[1] == docs
-
-    def test_calls_generator_with_query_and_all_docs(self, pipeline):
-        """Generator should receive original query and all reranked docs."""
-        docs = [make_doc("d1"), make_doc("d2"), make_doc("d3")]
-        state = make_state(
-            query="When was Beyonce born?",
-            documents=docs,
-            graded_documents=[make_doc("d1")],
-        )
-
-        pipeline._generate_node(state)
-
         pipeline.generator.generate.assert_called_once_with(
             "When was Beyonce born?", docs, max_chunks=5
         )
 
-    def test_uses_original_query_not_rewritten(self, pipeline):
-        """Generator should always use the original query, not the rewritten one."""
-        docs = [make_doc("relevant doc")]
+    def test_retry_uses_stricter_prompt(self, pipeline):
+        """Retry (retry_count > 0) should use RETRY_PROMPT and _generate_text."""
+        docs = [make_doc("d1")]
         state = make_state(
-            query="When was she born?",
-            rewritten_query="Beyonce birth year",
+            query="When was Beyonce born?",
             documents=docs,
-            graded_documents=docs,
+            retry_count=1,
+        )
+
+        result = pipeline._generate_node(state)
+
+        assert result["generation"] == "Precise answer text."
+        pipeline.generator._generate_text.assert_called_once()
+        pipeline.generator._parse_answer.assert_called_once()
+        # generator.generate should NOT be called on retry
+        pipeline.generator.generate.assert_not_called()
+
+    def test_retry_prompt_contains_question(self, pipeline):
+        """Retry prompt should contain the original question."""
+        state = make_state(
+            query="test question?",
+            documents=[make_doc("d1")],
+            retry_count=1,
         )
 
         pipeline._generate_node(state)
 
-        call_args = pipeline.generator.generate.call_args[0]
-        assert call_args[0] == "When was she born?"
+        call_args = pipeline.generator._generate_text.call_args[0][0]
+        assert "test question?" in call_args
 
-    def test_generates_even_when_no_graded_docs(self, pipeline):
-        """When graded_documents is empty, should still use all reranked docs."""
-        retrieved = [
-            make_doc("d1", "1"),
-            make_doc("d2", "2"),
-            make_doc("d3", "3"),
-            make_doc("d4", "4"),
-        ]
-        state = make_state(query="hard query", documents=retrieved, graded_documents=[])
+    def test_logs_attempt_number(self, pipeline):
+        """Step log should include the attempt number."""
+        state = make_state(retry_count=0)
+        result = pipeline._generate_node(state)
+        assert "attempt 1" in result["intermediate_steps"][0]
 
-        pipeline._generate_node(state)
+        state = make_state(retry_count=1, documents=[make_doc("d1")])
+        result = pipeline._generate_node(state)
+        assert "attempt 2" in result["intermediate_steps"][0]
 
-        call_args = pipeline.generator.generate.call_args
-        docs_used = call_args[0][1]
-        assert len(docs_used) == 4
-        assert docs_used[0]["doc_id"] == "1"
-
-    def test_generates_with_few_retrieved(self, pipeline):
-        """Should pass all available docs even if fewer than max_chunks."""
-        retrieved = [make_doc("d1", "1"), make_doc("d2", "2")]
-        state = make_state(query="query", documents=retrieved, graded_documents=[])
-
-        pipeline._generate_node(state)
-
-        call_args = pipeline.generator.generate.call_args
-        docs_used = call_args[0][1]
-        assert len(docs_used) == 2
-
-    def test_logs_intermediate_step(self, pipeline):
-        """Node should log total docs and graded count."""
-        docs = [make_doc("A"), make_doc("B"), make_doc("C")]
-        graded = [make_doc("A"), make_doc("B")]
-        state = make_state(query="q", documents=docs, graded_documents=graded)
-
+    def test_generates_with_empty_docs(self, pipeline):
+        """Should handle empty documents list gracefully."""
+        state = make_state(query="query", documents=[], retry_count=0)
         result = pipeline._generate_node(state)
 
-        assert len(result["intermediate_steps"]) == 1
-        assert "3" in result["intermediate_steps"][0]  # 3 total docs
-        assert "2" in result["intermediate_steps"][0]  # 2 graded relevant
+        assert "generation" in result
 
 
-class TestQueryMethodNoRetry:
-    """Tests for query() when grading passes on first attempt (no retry)."""
+class TestGradeAnswerNode:
+    """Tests for _grade_answer_node."""
 
     @pytest.fixture
     def pipeline(self):
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+        retriever, reranker, generator, answer_grader = create_mock_components()
+        answer_grader.grade.return_value = True
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+        )
+
+    def test_acceptable_answer(self, pipeline):
+        """Acceptable answer should set answer_is_acceptable=True."""
+        pipeline.answer_grader.grade.return_value = True
+        docs = [make_doc("context A")]
+        state = make_state(
+            query="test query",
+            generation="good answer",
+            documents=docs,
+        )
+
+        result = pipeline._grade_answer_node(state)
+
+        assert result["answer_is_acceptable"] is True
+
+    def test_unacceptable_answer(self, pipeline):
+        """Unacceptable answer should set answer_is_acceptable=False."""
+        pipeline.answer_grader.grade.return_value = False
+        docs = [make_doc("context A")]
+        state = make_state(
+            query="test query",
+            generation="bad answer",
+            documents=docs,
+        )
+
+        result = pipeline._grade_answer_node(state)
+
+        assert result["answer_is_acceptable"] is False
+
+    def test_increments_retry_count_on_failure(self, pipeline):
+        """retry_count should increment when answer is not acceptable."""
+        pipeline.answer_grader.grade.return_value = False
+        state = make_state(
+            query="q",
+            generation="bad",
+            documents=[make_doc("d")],
+            retry_count=0,
+        )
+
+        result = pipeline._grade_answer_node(state)
+
+        assert result["retry_count"] == 1
+
+    def test_does_not_increment_on_success(self, pipeline):
+        """retry_count should NOT be in update when answer is acceptable."""
+        pipeline.answer_grader.grade.return_value = True
+        state = make_state(
+            query="q",
+            generation="good",
+            documents=[make_doc("d")],
+            retry_count=0,
+        )
+
+        result = pipeline._grade_answer_node(state)
+
+        assert "retry_count" not in result
+
+    def test_calls_grader_with_doc_contents(self, pipeline):
+        """Grader should receive document content strings."""
+        docs = [make_doc("content A"), make_doc("content B")]
+        state = make_state(
+            query="test query",
+            generation="test answer",
+            documents=docs,
+        )
+
+        pipeline._grade_answer_node(state)
+
+        pipeline.answer_grader.grade.assert_called_once_with(
+            "test query", "test answer", ["content A", "content B"]
+        )
+
+    def test_limits_to_5_docs(self, pipeline):
+        """Should only send first 5 docs to grader."""
+        docs = [make_doc(f"doc {i}", f"d{i}") for i in range(10)]
+        state = make_state(
+            query="q",
+            generation="answer",
+            documents=docs,
+        )
+
+        pipeline._grade_answer_node(state)
+
+        call_args = pipeline.answer_grader.grade.call_args[0]
+        assert len(call_args[2]) == 5
+
+    def test_logs_intermediate_step(self, pipeline):
+        """Node should log the grading result."""
+        pipeline.answer_grader.grade.return_value = True
+        state = make_state(query="q", generation="a", documents=[make_doc("d")])
+        result = pipeline._grade_answer_node(state)
+
+        assert "acceptable" in result["intermediate_steps"][0]
+
+
+class TestDecideAfterGrading:
+    """Tests for _decide_after_grading routing logic."""
+
+    @pytest.fixture
+    def pipeline(self):
+        retriever, reranker, generator, answer_grader = create_mock_components()
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+            max_retries=1,
+        )
+
+    def test_accept_when_acceptable(self, pipeline):
+        """Should accept when answer is acceptable."""
+        state = make_state(answer_is_acceptable=True, retry_count=0)
+        assert pipeline._decide_after_grading(state) == "accept"
+
+    def test_retry_when_not_acceptable(self, pipeline):
+        """Should retry when answer is not acceptable and retries remain."""
+        state = make_state(answer_is_acceptable=False, retry_count=1)
+        assert pipeline._decide_after_grading(state) == "retry"
+
+    def test_accept_at_max_retries(self, pipeline):
+        """Should accept when max retries exceeded."""
+        state = make_state(answer_is_acceptable=False, retry_count=2)
+        assert pipeline._decide_after_grading(state) == "accept"
+
+    def test_accept_past_max_retries(self, pipeline):
+        """Should accept when well past max retries."""
+        state = make_state(answer_is_acceptable=False, retry_count=5)
+        assert pipeline._decide_after_grading(state) == "accept"
+
+    def test_default_acceptable_is_true(self, pipeline):
+        """Missing answer_is_acceptable should default to True (accept)."""
+        state = {"query": "q", "retry_count": 0, "intermediate_steps": []}
+        assert pipeline._decide_after_grading(state) == "accept"
+
+
+class TestDecideWithRerankThreshold:
+    """Tests for _decide_after_grading with rerank threshold enabled."""
+
+    @pytest.fixture
+    def pipeline(self):
+        retriever, reranker, generator, answer_grader = create_mock_components()
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+            max_retries=2,
+            enable_rerank_threshold=True,
+            rerank_threshold=1.0,
+        )
+
+    def test_accept_when_low_retrieval_quality(self, pipeline):
+        """Should accept (skip retry) when rerank score below threshold."""
+        state = make_state(
+            answer_is_acceptable=False,
+            retry_count=1,
+            min_rerank_score=0.5,  # below threshold of 1.0
+        )
+        assert pipeline._decide_after_grading(state) == "accept"
+
+    def test_retry_when_good_retrieval_quality(self, pipeline):
+        """Should retry when rerank score above threshold."""
+        state = make_state(
+            answer_is_acceptable=False,
+            retry_count=1,
+            min_rerank_score=2.0,  # above threshold of 1.0
+        )
+        assert pipeline._decide_after_grading(state) == "retry"
+
+    def test_accept_when_score_equals_threshold(self, pipeline):
+        """Score exactly at threshold should still trigger retry (< check)."""
+        state = make_state(
+            answer_is_acceptable=False,
+            retry_count=1,
+            min_rerank_score=1.0,  # equal to threshold
+        )
+        # min_score < threshold is False (1.0 < 1.0), so should retry
+        assert pipeline._decide_after_grading(state) == "retry"
+
+    def test_threshold_ignored_when_acceptable(self, pipeline):
+        """Threshold should not matter when answer is acceptable."""
+        state = make_state(
+            answer_is_acceptable=True,
+            retry_count=0,
+            min_rerank_score=-5.0,  # terrible score, but answer is fine
+        )
+        assert pipeline._decide_after_grading(state) == "accept"
+
+
+class TestDecideCustomMaxRetries:
+    """Tests for _decide_after_grading with custom max_retries."""
+
+    def test_custom_max_retries_2(self):
+        """max_retries=2 should allow 2 retries."""
+        retriever, reranker, generator, answer_grader = create_mock_components()
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+            max_retries=2,
+        )
+
+        # retry_count=1 -> retry (1 failure, still under max)
+        state = make_state(answer_is_acceptable=False, retry_count=1)
+        assert pipeline._decide_after_grading(state) == "retry"
+
+        # retry_count=2 -> retry (2 failures, check is > not >=)
+        state = make_state(answer_is_acceptable=False, retry_count=2)
+        assert pipeline._decide_after_grading(state) == "retry"
+
+        # retry_count=3 -> accept (3 > 2, max retries exceeded)
+        state = make_state(answer_is_acceptable=False, retry_count=3)
+        assert pipeline._decide_after_grading(state) == "accept"
+
+
+class TestQueryMethodLinear:
+    """Tests for query() in linear mode (no features enabled)."""
+
+    @pytest.fixture
+    def pipeline(self):
+        retriever, reranker, generator, _ = create_mock_components()
 
         reranked = [make_doc("A", "1"), make_doc("B", "2"), make_doc("C", "3")]
-
         retriever.search.return_value = reranked
         reranker.rerank.return_value = reranked
-        grader.grade_batch.return_value = [True, True, True]  # >= 3 relevant
         generator.generate.return_value = {"answer": "Test answer"}
 
         return AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
         )
 
     def test_returns_required_keys(self, pipeline):
@@ -703,114 +1024,203 @@ class TestQueryMethodNoRetry:
         assert "answer" in result
         assert "steps" in result
         assert "num_docs_retrieved" in result
-        assert "num_docs_graded" in result
         assert "retry_count" in result
+        assert "min_rerank_score" in result
+        assert "used_fallback_retrieval" in result
+        assert "used_web_search" in result
+        assert "answer_is_acceptable" in result
+
+    def test_web_search_not_used_by_default(self, pipeline):
+        """Linear mode should not use web search."""
+        result = pipeline.query("test query")
+        assert result["used_web_search"] is False
 
     def test_returns_original_query(self, pipeline):
         """Result should contain the original query string."""
         result = pipeline.query("When was Beyonce born?")
-
         assert result["query"] == "When was Beyonce born?"
 
     def test_returns_generated_answer(self, pipeline):
         """Result should contain the generated answer."""
         result = pipeline.query("test query")
-
         assert result["answer"] == "Test answer"
 
-    def test_steps_has_three_entries(self, pipeline):
-        """No-retry pipeline should produce exactly 3 steps."""
+    def test_steps_has_two_entries(self, pipeline):
+        """Linear pipeline should produce exactly 2 steps (retrieve + generate)."""
         result = pipeline.query("test query")
-
-        assert len(result["steps"]) == 3
-
-    def test_num_docs_retrieved(self, pipeline):
-        """num_docs_retrieved should match reranked count."""
-        result = pipeline.query("test query")
-
-        assert result["num_docs_retrieved"] == 3
-
-    def test_num_docs_graded(self, pipeline):
-        """num_docs_graded should match filtered count."""
-        result = pipeline.query("test query")
-
-        assert result["num_docs_graded"] == 3
+        assert len(result["steps"]) == 2
 
     def test_retry_count_zero(self, pipeline):
-        """No retry should mean retry_count=0."""
+        """Linear mode should have retry_count=0."""
         result = pipeline.query("test query")
-
         assert result["retry_count"] == 0
 
-    def test_intermediate_steps_accumulate(self, pipeline):
-        """Steps should accumulate across all 3 nodes."""
+    def test_fallback_not_used(self, pipeline):
+        """Linear mode should not use fallback retrieval."""
         result = pipeline.query("test query")
-
-        steps = result["steps"]
-        assert any("Retrieved" in s for s in steps)
-        assert any("Graded" in s for s in steps)
-        assert any("Generated" in s for s in steps)
+        assert result["used_fallback_retrieval"] is False
 
 
-class TestQueryMethodWithRetry:
-    """Tests for query() when retry is triggered."""
+class TestQueryMethodAdaptive:
+    """Tests for query() with adaptive retrieval."""
 
-    @pytest.fixture
-    def pipeline(self):
-        """Pipeline where first grading fails (<3), retry succeeds."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+    def _make_pipeline(self, primary_scores, fallback_scores=None):
+        """Helper to create pipeline with configurable rerank scores."""
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
 
-        reranked = [make_doc("A", "1"), make_doc("B", "2"), make_doc("C", "3")]
-        retriever.search.return_value = reranked
-        reranker.rerank.return_value = reranked
+        primary_docs = [make_doc(f"P{i}", f"p{i}", s) for i, s in enumerate(primary_scores)]
+        retriever.search.return_value = primary_docs
+        generator.generate.return_value = {"answer": "Test answer"}
 
-        # First call: 1 relevant (triggers rewrite), second call: 3 relevant
-        grader.grade_batch.side_effect = [
-            [True, False, False],
-            [True, True, True],
-        ]
-        generator.generate.return_value = {"answer": "Retry answer"}
-        rewriter.rewrite.return_value = "better query"
+        if fallback_scores is not None:
+            fallback_docs = [make_doc(f"F{i}", f"f{i}", s) for i, s in enumerate(fallback_scores)]
+            fallback.search.return_value = fallback_docs
+            # Reranker: return primary on first call, fallback on second
+            reranker.rerank.side_effect = [primary_docs, fallback_docs]
+        else:
+            reranker.rerank.return_value = primary_docs
 
         return AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+            retrieval_threshold=0.0,
+        )
+
+    def test_good_retrieval_skips_fallback(self):
+        """Good rerank scores should skip fallback retrieval."""
+        pipeline = self._make_pipeline([3.0, 1.5, 0.5])
+        result = pipeline.query("test")
+
+        assert result["used_fallback_retrieval"] is False
+        assert result["answer"] == "Test answer"
+        assert len(result["steps"]) == 2  # retrieve + generate
+
+    def test_poor_retrieval_triggers_fallback(self):
+        """Poor rerank scores should trigger fallback retrieval."""
+        pipeline = self._make_pipeline([-2.0, -3.0], [2.0, 1.0])
+        result = pipeline.query("test")
+
+        assert result["used_fallback_retrieval"] is True
+        assert result["answer"] == "Test answer"
+        assert len(result["steps"]) == 3  # retrieve + fallback + generate
+        assert any("Fallback" in s for s in result["steps"])
+
+    def test_fallback_uses_fallback_retriever(self):
+        """Fallback path should use fallback_retriever, not primary."""
+        pipeline = self._make_pipeline([-2.0], [1.0])
+        pipeline.query("test")
+
+        pipeline.fallback_retriever.search.assert_called_once()
+
+
+class TestQueryMethodWithAnswerGrading:
+    """Tests for query() when answer grading is enabled and answer passes."""
+
+    @pytest.fixture
+    def pipeline(self):
+        retriever, reranker, generator, answer_grader = create_mock_components()
+
+        reranked = [make_doc("A", "1"), make_doc("B", "2"), make_doc("C", "3")]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+        generator.generate.return_value = {"answer": "Test answer"}
+        answer_grader.grade.return_value = True
+
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+        )
+
+    def test_returns_answer(self, pipeline):
+        """Should return the generated answer when grading passes."""
+        result = pipeline.query("test query")
+        assert result["answer"] == "Test answer"
+
+    def test_steps_has_three_entries(self, pipeline):
+        """Pipeline with grading should produce 3 steps."""
+        result = pipeline.query("test query")
+        assert len(result["steps"]) == 3
+
+    def test_answer_is_acceptable(self, pipeline):
+        """answer_is_acceptable should be True when grading passes."""
+        result = pipeline.query("test query")
+        assert result["answer_is_acceptable"] is True
+
+    def test_retry_count_zero(self, pipeline):
+        """No retry needed when grading passes."""
+        result = pipeline.query("test query")
+        assert result["retry_count"] == 0
+
+    def test_steps_include_grading(self, pipeline):
+        """Steps should include answer grading step."""
+        result = pipeline.query("test query")
+        steps = result["steps"]
+        assert any("Answer grade" in s for s in steps)
+
+
+class TestQueryMethodWithRetry:
+    """Tests for query() when answer grading fails and triggers retry."""
+
+    @pytest.fixture
+    def pipeline(self):
+        """Pipeline where first grading fails, retry succeeds."""
+        retriever, reranker, generator, answer_grader = create_mock_components()
+
+        reranked = [make_doc("A", "1"), make_doc("B", "2")]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+
+        generator.generate.return_value = {"answer": "Bad first answer"}
+        generator._format_context.return_value = "[1] context"
+        generator._generate_text.return_value = "Good retry answer."
+        generator._parse_answer.return_value = "Good retry answer."
+
+        # First call: not acceptable, second call: acceptable
+        answer_grader.grade.side_effect = [False, True]
+
+        return AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+            max_retries=1,
         )
 
     def test_retry_produces_answer(self, pipeline):
-        """Pipeline should still produce an answer after retry."""
-        result = pipeline.query("vague query")
-
-        assert result["answer"] == "Retry answer"
+        """Pipeline should produce answer from retry."""
+        result = pipeline.query("test query")
+        assert result["answer"] == "Good retry answer."
 
     def test_retry_count_is_one(self, pipeline):
         """Single retry should give retry_count=1."""
-        result = pipeline.query("vague query")
-
+        result = pipeline.query("test query")
         assert result["retry_count"] == 1
 
-    def test_steps_include_rewrite(self, pipeline):
-        """Steps should include the rewrite action."""
-        result = pipeline.query("vague query")
-
+    def test_steps_include_retry_generation(self, pipeline):
+        """Steps should show both generation attempts."""
+        result = pipeline.query("test query")
         steps = result["steps"]
-        assert any("Rewrote" in s for s in steps)
+        assert any("attempt 1" in s for s in steps)
+        assert any("attempt 2" in s for s in steps)
 
-    def test_more_steps_than_no_retry(self, pipeline):
-        """Retry adds extra steps (rewrite + retrieve + grade)."""
-        result = pipeline.query("vague query")
+    def test_more_steps_than_linear(self, pipeline):
+        """Retry should produce more steps than linear (3 base + 2 retry)."""
+        result = pipeline.query("test query")
+        # retrieve + generate + grade(fail) + generate(retry) + grade(pass) = 5
+        assert len(result["steps"]) == 5
 
-        # 3 (first pass) + 1 (rewrite) + 2 (retrieve + grade) + 1 (generate) = 7
-        assert len(result["steps"]) > 3
-
-    def test_rewriter_called(self, pipeline):
-        """QueryRewriter should be called during retry."""
-        pipeline.query("vague query")
-
-        pipeline.query_rewriter.rewrite.assert_called_once()
+    def test_grader_called_twice(self, pipeline):
+        """Answer grader should be called twice (original + retry)."""
+        pipeline.query("test query")
+        assert pipeline.answer_grader.grade.call_count == 2
 
 
 class TestQueryMethodMaxRetries:
@@ -818,44 +1228,244 @@ class TestQueryMethodMaxRetries:
 
     @pytest.fixture
     def pipeline(self):
-        """Pipeline where grading always fails, hitting max retries."""
-        retriever, reranker, generator, grader, rewriter = create_mock_components()
+        """Pipeline where answer grading always fails."""
+        retriever, reranker, generator, answer_grader = create_mock_components()
 
-        reranked = [make_doc("A", "1"), make_doc("B", "2"), make_doc("C", "3")]
+        reranked = [make_doc("A", "1"), make_doc("B", "2")]
         retriever.search.return_value = reranked
         reranker.rerank.return_value = reranked
 
-        # Always returns only 1 relevant (below threshold of 3)
-        grader.grade_batch.return_value = [True, False, False]
-        generator.generate.return_value = {"answer": "Fallback answer"}
-        rewriter.rewrite.return_value = "rewritten query"
+        generator.generate.return_value = {"answer": "First answer"}
+        generator._format_context.return_value = "[1] context"
+        generator._generate_text.return_value = "Retry answer."
+        generator._parse_answer.return_value = "Retry answer."
+
+        # Always fails
+        answer_grader.grade.return_value = False
 
         return AgenticRAGPipeline(
             hybrid_retriever=retriever,
             reranker=reranker,
             generator=generator,
-            grader=grader,
-            query_rewriter=rewriter,
-            max_retries=2,
+            answer_grader=answer_grader,
+            enable_answer_grading=True,
+            max_retries=1,
         )
 
     def test_still_generates_answer(self, pipeline):
-        """Should generate an answer even after max retries."""
-        result = pipeline.query("impossible query")
-
-        assert result["answer"] == "Fallback answer"
+        """Should return an answer even after max retries."""
+        result = pipeline.query("test query")
+        assert result["answer"] == "Retry answer."
 
     def test_retry_count_matches_max(self, pipeline):
-        """retry_count should equal max_retries."""
-        result = pipeline.query("impossible query")
-
+        """retry_count should reflect grading failures."""
+        result = pipeline.query("test query")
+        # grade fails → retry_count=1, retry, grade fails → retry_count=2
+        # 2 > max_retries(1) → accept
         assert result["retry_count"] == 2
 
-    def test_rewriter_called_max_times(self, pipeline):
-        """Rewriter should be called exactly max_retries times."""
-        pipeline.query("impossible query")
+    def test_grader_called_twice(self, pipeline):
+        """Grader called for initial + 1 retry = 2 times."""
+        pipeline.query("test query")
+        assert pipeline.answer_grader.grade.call_count == 2
 
-        assert pipeline.query_rewriter.rewrite.call_count == 2
+
+class TestFeatureFlags:
+    """Tests for pipeline behavior with different feature flag combinations."""
+
+    def test_linear_config(self):
+        """All disabled: should work as simple retrieve->generate."""
+        retriever, reranker, generator, _ = create_mock_components()
+        reranked = [make_doc("A", "1")]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+        generator.generate.return_value = {"answer": "Linear answer"}
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+        )
+
+        result = pipeline.query("test")
+        assert result["answer"] == "Linear answer"
+        assert len(result["steps"]) == 2
+
+    def test_adaptive_only_config(self):
+        """Adaptive retrieval only, no answer grading."""
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
+
+        reranked = [make_doc("A", "1", 2.0)]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+        generator.generate.return_value = {"answer": "Adaptive answer"}
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+            retrieval_threshold=0.0,
+        )
+
+        result = pipeline.query("test")
+        assert result["answer"] == "Adaptive answer"
+        assert result["used_fallback_retrieval"] is False
+        # retrieve + generate (no fallback because score > threshold)
+        assert len(result["steps"]) == 2
+
+    def test_rerank_threshold_only(self):
+        """Rerank threshold without answer grading: metadata only."""
+        retriever, reranker, generator, _ = create_mock_components()
+        reranked = [make_doc("A", "1", 0.5)]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+        generator.generate.return_value = {"answer": "Answer"}
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            enable_rerank_threshold=True,
+            rerank_threshold=1.0,
+        )
+
+        result = pipeline.query("test")
+        assert result["answer"] == "Answer"
+        assert result["min_rerank_score"] == 0.5
+        # No retry since answer grading is disabled
+        assert result["retry_count"] == 0
+
+    def test_web_search_only_config(self):
+        """Web search only (no adaptive, no grading)."""
+        retriever, reranker, generator, _ = create_mock_components()
+        web_tool = MagicMock()
+        web_tool.search.return_value = [
+            {"content": "Web result", "source": "https://example.com"},
+        ]
+
+        reranked = [make_doc("A", "1", -6.0)]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+        generator.generate.return_value = {"answer": "Web answer"}
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            web_search_tool=web_tool,
+            enable_web_search=True,
+            web_search_threshold=-5.0,
+        )
+
+        result = pipeline.query("test")
+        assert result["answer"] == "Web answer"
+        assert result["used_web_search"] is True
+        web_tool.search.assert_called_once()
+
+    def test_web_search_skipped_when_good_scores(self):
+        """Web search should be skipped when rerank scores are good."""
+        retriever, reranker, generator, _ = create_mock_components()
+        web_tool = MagicMock()
+
+        reranked = [make_doc("A", "1", 3.0)]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+        generator.generate.return_value = {"answer": "Local answer"}
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            web_search_tool=web_tool,
+            enable_web_search=True,
+            web_search_threshold=-5.0,
+        )
+
+        result = pipeline.query("test")
+        assert result["answer"] == "Local answer"
+        assert result["used_web_search"] is False
+        web_tool.search.assert_not_called()
+
+    def test_adaptive_plus_web_search_config(self):
+        """Adaptive + web search: both fallbacks chained."""
+        retriever, reranker, generator, _ = create_mock_components()
+        fallback = MagicMock()
+        web_tool = MagicMock()
+        web_tool.search.return_value = [
+            {"content": "Web hit", "source": "https://example.com"},
+        ]
+
+        # Primary retrieval: very poor scores → triggers fallback
+        primary_docs = [make_doc("A", "1", -8.0)]
+        fallback_docs = [make_doc("F1", "f1", -6.0)]
+        retriever.search.return_value = primary_docs
+        fallback.search.return_value = fallback_docs
+        # First rerank: primary docs, second rerank: fallback docs
+        reranker.rerank.side_effect = [primary_docs, fallback_docs]
+        generator.generate.return_value = {"answer": "Combined answer"}
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            fallback_retriever=fallback,
+            web_search_tool=web_tool,
+            enable_adaptive_retrieval=True,
+            enable_web_search=True,
+            retrieval_threshold=0.0,
+            web_search_threshold=-5.0,
+        )
+
+        result = pipeline.query("test")
+        assert result["answer"] == "Combined answer"
+        assert result["used_fallback_retrieval"] is True
+        assert result["used_web_search"] is True
+        web_tool.search.assert_called_once()
+
+    def test_full_agentic_config(self):
+        """Adaptive + answer grading: complete agentic pipeline."""
+        retriever, reranker, generator, answer_grader = create_mock_components()
+        fallback = MagicMock()
+
+        reranked = [make_doc("A", "1", 2.0)]
+        retriever.search.return_value = reranked
+        reranker.rerank.return_value = reranked
+        generator.generate.return_value = {"answer": "Full answer"}
+        answer_grader.grade.return_value = True
+
+        pipeline = AgenticRAGPipeline(
+            hybrid_retriever=retriever,
+            reranker=reranker,
+            generator=generator,
+            answer_grader=answer_grader,
+            fallback_retriever=fallback,
+            enable_adaptive_retrieval=True,
+            retrieval_threshold=0.0,
+            enable_answer_grading=True,
+        )
+
+        result = pipeline.query("test")
+        assert result["answer"] == "Full answer"
+        assert result["min_rerank_score"] == 2.0
+        assert result["answer_is_acceptable"] is True
+        assert result["used_fallback_retrieval"] is False
+
+
+class TestRetryPrompt:
+    """Tests for RETRY_PROMPT template."""
+
+    def test_retry_prompt_has_placeholders(self):
+        """RETRY_PROMPT must contain {context} and {question}."""
+        assert "{context}" in AgenticRAGPipeline.RETRY_PROMPT
+        assert "{question}" in AgenticRAGPipeline.RETRY_PROMPT
+
+    def test_retry_prompt_mentions_precision(self):
+        """RETRY_PROMPT should emphasize precision."""
+        prompt_lower = AgenticRAGPipeline.RETRY_PROMPT.lower()
+        assert "precise" in prompt_lower
 
 
 if __name__ == "__main__":

@@ -27,6 +27,9 @@ datasets==3.1.0
 # Re-ranking Models
 # BGE reranker support via sentence-transformers
 
+# Web Search
+ddgs>=9.0.0
+
 # API & Server (optional)
 fastapi==0.115.5
 uvicorn==0.32.1

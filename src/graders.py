@@ -1,11 +1,12 @@
 """
-Document relevance grading and query rewriting for Agentic RAG.
+LLM-based grading and query rewriting for Agentic RAG.
 
 This module provides LLM-based utilities for the self-correcting RAG pipeline:
 - DocumentGrader: Assesses whether retrieved documents are relevant to a query
 - QueryRewriter: Rephrases queries to improve retrieval quality on retry
+- AnswerGrader: Evaluates whether a generated answer addresses the query
 
-Both classes reuse the existing LLMGenerator to avoid loading additional models.
+All classes reuse the existing LLMGenerator to avoid loading additional models.
 """
 
 import json
@@ -396,3 +397,102 @@ class QueryRewriter:
             return original_query
 
         return first_line
+
+
+class AnswerGrader:
+    """
+    Grades answer quality using LLM binary classification.
+
+    Determines whether a generated answer correctly addresses the user's
+    question based on the provided context documents. Used by the agentic
+    pipeline to decide whether to retry generation.
+
+    Attributes:
+        generator: LLMGenerator instance for inference.
+    """
+
+    GRADING_PROMPT = (
+        "Does this answer correctly address the question based on the context?\n"
+        "\n"
+        "Question: {query}\n"
+        "Answer: {answer}\n"
+        "\n"
+        "Context:\n"
+        "{documents}\n"
+        "\n"
+        "Rules:\n"
+        "- 'yes' if the answer addresses the question using context information\n"
+        "- 'no' if the answer is wrong, off-topic, or unsupported by the context\n"
+        "\n"
+        'Respond with ONLY "yes" or "no".'
+    )
+
+    def __init__(self, generator: LLMGenerator):
+        """
+        Initialize the answer grader.
+
+        Args:
+            generator: An already-loaded LLMGenerator instance. The grader
+                      reuses this model to avoid additional VRAM usage.
+        """
+        self.generator = generator
+
+    def grade(self, query: str, answer: str, documents: List[str]) -> bool:
+        """
+        Grade whether the answer properly addresses the question.
+
+        Uses zero-shot binary classification: the LLM checks if the answer
+        is supported by the context and addresses the query.
+
+        Args:
+            query: The user's search query.
+            answer: The generated answer to evaluate.
+            documents: Context document texts used for generation.
+
+        Returns:
+            True if the answer is acceptable, False otherwise.
+            Returns False for empty answers.
+        """
+        if not answer or not answer.strip():
+            return False
+
+        docs_text = "\n".join(f"{i+1}. {doc[:500]}" for i, doc in enumerate(documents))
+
+        prompt = self.GRADING_PROMPT.format(
+            query=query,
+            answer=answer,
+            documents=docs_text,
+        )
+
+        original_max_tokens = self.generator.max_new_tokens
+        self.generator.max_new_tokens = 10
+        try:
+            response = self.generator._generate_text(prompt)
+        finally:
+            self.generator.max_new_tokens = original_max_tokens
+
+        return self._parse_grade(response)
+
+    def _parse_grade(self, response: str) -> bool:
+        """
+        Parse a yes/no grading response into a boolean.
+
+        Defaults to True (permissive) if ambiguous, to avoid unnecessary
+        retries on borderline answers.
+
+        Args:
+            response: Raw LLM output text.
+
+        Returns:
+            True if acceptable, False if not.
+        """
+        cleaned = response.strip().lower()
+        logger.debug(f"Answer grading response: '{cleaned}'")
+
+        if "no" in cleaned and "yes" not in cleaned:
+            return False
+        if "yes" in cleaned:
+            return True
+
+        logger.warning(f"Ambiguous answer grade: '{cleaned}', defaulting to acceptable")
+        return True
