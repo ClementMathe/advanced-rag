@@ -49,7 +49,7 @@ Direct answer:"""
         model_name: str = "microsoft/Phi-3-mini-4k-instruct",
         device: Optional[str] = None,
         load_in_4bit: bool = True,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 80,
         temperature: float = 0.1,
         top_p: float = 0.9,
         prompt_template: Optional[str] = None,
@@ -197,13 +197,24 @@ Direct answer:"""
         """
         Generate text from prompt using the LLM.
 
+        Uses chat template when available (instruction-tuned models like Qwen),
+        falls back to raw tokenization for base models.
+
         Args:
             prompt: Input prompt
 
         Returns:
             Generated text
         """
-        # Tokenize with truncation
+        # Use chat template if available (instruction-tuned models)
+        if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template:
+            messages = [{"role": "user", "content": prompt}]
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
@@ -211,22 +222,6 @@ Direct answer:"""
             max_length=2048,
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        # Define stop sequences to prevent rambling
-        stop_sequences = [
-            "\n\nQuestion:",
-            "\n\nHuman:",
-            "\n\nBased on",
-            "\n\nAccording to",
-            "I cannot answer",
-        ]
-
-        # Encode stop sequences
-        stop_token_ids = []
-        for stop_seq in stop_sequences:
-            tokens = self.tokenizer.encode(stop_seq, add_special_tokens=False)
-            if tokens:
-                stop_token_ids.append(tokens[0])  # Use first token as indicator
 
         # Generate
         with torch.no_grad():
@@ -276,6 +271,12 @@ Direct answer:"""
             "Can you tell me",
             "Given the",
             "This information",
+            "You are an AI",
+            "You are a helpful",
+            "As an AI",
+            "I'm an AI",
+            "Note:",
+            "Additional",
         ]
 
         for phrase in stop_phrases:

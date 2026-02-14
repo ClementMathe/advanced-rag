@@ -143,6 +143,30 @@ class TestLLMGenerator:
         parsed = mock_generator._parse_answer(raw)
         assert parsed == "Paris is the capital."
 
+    def test_parse_answer_stops_at_ai_hallucination(self, mock_generator):
+        """Test answer parsing stops at 'You are an AI' hallucination."""
+        raw = "Paris is the capital. You are an AI assistant designed to help."
+        parsed = mock_generator._parse_answer(raw)
+        assert parsed == "Paris is the capital."
+
+    def test_parse_answer_stops_at_helpful_hallucination(self, mock_generator):
+        """Test answer parsing stops at 'You are a helpful' hallucination."""
+        raw = "Paris. You are a helpful assistant that answers questions."
+        parsed = mock_generator._parse_answer(raw)
+        assert parsed == "Paris."
+
+    def test_parse_answer_stops_at_as_an_ai(self, mock_generator):
+        """Test answer parsing stops at 'As an AI' hallucination."""
+        raw = "The answer is Paris. As an AI, I cannot verify this."
+        parsed = mock_generator._parse_answer(raw)
+        assert parsed == "The answer is Paris."
+
+    def test_parse_answer_stops_at_note(self, mock_generator):
+        """Test answer parsing stops at 'Note:' trailing content."""
+        raw = "Paris is the capital. Note: this is from the context."
+        parsed = mock_generator._parse_answer(raw)
+        assert parsed == "Paris is the capital."
+
     def test_generate_structure(self, mock_generator):
         """Test generate returns correct structure."""
         mock_generator._generate_text = Mock(return_value="Paris")
@@ -393,6 +417,112 @@ Answer:"""
 
             assert "Test context" in prompt
             assert "Test question" in prompt
+
+
+class TestChatTemplate:
+    """Test suite for chat template wrapping in _generate_text."""
+
+    @pytest.fixture(autouse=True)
+    def mock_cuda_memory(self):
+        """Mock CUDA memory functions globally."""
+        with (
+            patch("torch.cuda.memory_allocated", return_value=1_000_000_000),
+            patch("torch.cuda.memory_reserved", return_value=2_000_000_000),
+        ):
+            yield
+
+    @pytest.fixture
+    def generator_with_chat_template(self):
+        """Create a mock generator whose tokenizer has a chat template."""
+        with (
+            patch("src.generator.AutoModelForCausalLM.from_pretrained") as mock_model_cls,
+            patch("src.generator.AutoTokenizer.from_pretrained") as mock_tokenizer_cls,
+        ):
+            mock_model_cls.return_value = create_mock_model()
+            tokenizer = create_mock_tokenizer()
+            tokenizer.chat_template = "{% for message in messages %}..."
+            # apply_chat_template with tokenize=False returns a formatted string
+            tokenizer.apply_chat_template = MagicMock(
+                return_value="<|im_start|>user\nWhat is the capital?<|im_end|>\n<|im_start|>assistant\n"
+            )
+            # Tokenizer call returns proper dict for model.generate
+            tokenizer.return_value = {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.tensor([[1, 1, 1]]),
+            }
+            mock_tokenizer_cls.return_value = tokenizer
+
+            generator = LLMGenerator(
+                model_name="test/model",
+                load_in_4bit=False,
+                device="cpu",
+                max_new_tokens=10,
+            )
+
+            # Mock model.generate to return token ids
+            generator.model.generate = MagicMock(return_value=torch.tensor([[1, 2, 3, 4, 5]]))
+            generator.tokenizer.decode = MagicMock(return_value="Paris")
+
+            yield generator
+
+    @pytest.fixture
+    def generator_without_chat_template(self):
+        """Create a mock generator whose tokenizer has no chat template."""
+        with (
+            patch("src.generator.AutoModelForCausalLM.from_pretrained") as mock_model_cls,
+            patch("src.generator.AutoTokenizer.from_pretrained") as mock_tokenizer_cls,
+        ):
+            mock_model_cls.return_value = create_mock_model()
+            tokenizer = create_mock_tokenizer()
+            tokenizer.chat_template = None
+            tokenizer.return_value = {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.tensor([[1, 1, 1]]),
+            }
+            mock_tokenizer_cls.return_value = tokenizer
+
+            generator = LLMGenerator(
+                model_name="test/model",
+                load_in_4bit=False,
+                device="cpu",
+                max_new_tokens=10,
+            )
+
+            generator.model.generate = MagicMock(return_value=torch.tensor([[1, 2, 3, 4, 5]]))
+            generator.tokenizer.decode = MagicMock(return_value="Paris")
+
+            yield generator
+
+    def test_chat_template_used_when_available(self, generator_with_chat_template):
+        """Test that apply_chat_template is called for instruction-tuned models."""
+        generator_with_chat_template._generate_text("What is the capital?")
+
+        generator_with_chat_template.tokenizer.apply_chat_template.assert_called_once()
+        call_args = generator_with_chat_template.tokenizer.apply_chat_template.call_args
+        messages = call_args[0][0]
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "What is the capital?"
+
+    def test_chat_template_add_generation_prompt(self, generator_with_chat_template):
+        """Test that add_generation_prompt=True and tokenize=False are passed."""
+        generator_with_chat_template._generate_text("Test prompt")
+
+        call_kwargs = generator_with_chat_template.tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is True
+        assert call_kwargs["tokenize"] is False
+
+    def test_fallback_tokenization_without_chat_template(self, generator_without_chat_template):
+        """Test that raw tokenization is used when no chat template exists."""
+        generator_without_chat_template._generate_text("What is the capital?")
+
+        # Should NOT call apply_chat_template
+        assert (
+            not hasattr(generator_without_chat_template.tokenizer, "apply_chat_template")
+            or not generator_without_chat_template.tokenizer.apply_chat_template.called
+        )
+        # Should call tokenizer directly
+        generator_without_chat_template.tokenizer.assert_called()
 
 
 @pytest.mark.skipif(not TORCH_2_6_AVAILABLE, reason="Torch >= 2.6 required for safe model loading")
