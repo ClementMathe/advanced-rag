@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from src.chunking import Chunk
 from src.embeddings import EmbeddingModel, FAISSIndex
+from src.evaluation.metrics import MetricsCalculator
 from src.generator import LLMGenerator
 from src.pipeline import RAGPipeline
 from src.reranker import CrossEncoderReranker
@@ -39,125 +40,20 @@ from src.retriever import (
 from src.utils import LoggerConfig, ensure_dir
 
 
-class GenerationMetrics:
+class GenerationMetrics(MetricsCalculator):
     """
-    Metrics for evaluating generated answers.
+    Legacy wrapper around MetricsCalculator for backward compatibility.
 
-    Computes:
-    - Exact Match (EM)
-    - F1 token overlap
-    - ROUGE-L
-    - Faithfulness (anti-hallucination via embeddings)
+    New code should use MetricsCalculator directly from src.evaluation.metrics.
     """
 
     def __init__(self, embed_model):
-        """
-        Initialize metrics calculator.
-
-        Args:
-            embed_model: Embedding model for faithfulness computation
-        """
-        import re
-        import string
-        from collections import Counter
-
-        from nltk.tokenize import sent_tokenize
-        from rouge_score import rouge_scorer
-
-        self.embed_model = embed_model
-        self.rouge_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-        self._sent_tokenize = sent_tokenize
-        self._Counter = Counter
-        self._re = re
-        self._string = string
-
-    @staticmethod
-    def normalize_text(text: str) -> str:
-        """Normalize text for comparison."""
-        import re
-        import string
-
-        text = text.lower()
-        text = text.translate(str.maketrans("", "", string.punctuation))
-        text = re.sub(r"\b(a|an|the)\b", " ", text)
-        text = " ".join(text.split())
-        return text
-
-    def exact_match(self, prediction: str, ground_truth: str) -> float:
-        """Compute exact match score (1.0 if match, 0.0 otherwise)."""
-        pred_norm = self.normalize_text(prediction)
-        gt_norm = self.normalize_text(ground_truth)
-        return 1.0 if pred_norm == gt_norm else 0.0
-
-    def f1_score(self, prediction: str, ground_truth: str) -> float:
-        """Compute F1 token overlap score."""
-        from collections import Counter
-
-        pred_tokens = self.normalize_text(prediction).split()
-        gt_tokens = self.normalize_text(ground_truth).split()
-
-        if len(pred_tokens) == 0 or len(gt_tokens) == 0:
-            return 0.0
-
-        pred_counts = Counter(pred_tokens)
-        gt_counts = Counter(gt_tokens)
-        overlap = sum((pred_counts & gt_counts).values())
-
-        if overlap == 0:
-            return 0.0
-
-        precision = overlap / len(pred_tokens)
-        recall = overlap / len(gt_tokens)
-        f1 = 2 * precision * recall / (precision + recall)
-        return f1
-
-    def rouge_l(self, prediction: str, ground_truth: str) -> float:
-        """Compute ROUGE-L F1 score."""
-        scores = self.rouge_scorer.score(ground_truth, prediction)
-        return scores["rougeL"].fmeasure
-
-    def faithfulness(
-        self, answer: str, context_chunks: List[str], threshold: float = 0.65
-    ) -> float:
-        """
-        Compute faithfulness score (anti-hallucination).
-
-        Uses embedding similarity between answer sentences and context chunks.
-        """
-        from nltk.tokenize import sent_tokenize
-
-        if not answer.strip():
-            return 0.0
-
-        try:
-            sentences = sent_tokenize(answer)
-        except (LookupError, OSError):
-            # Fallback if NLTK data not available
-            sentences = [s.strip() for s in answer.split(".") if s.strip()]
-
-        if not sentences:
-            return 0.0
-
-        sentence_embs = self.embed_model.encode(sentences)
-        chunk_embs = self.embed_model.encode(context_chunks)
-
-        supported_count = 0
-
-        for sent_emb in sentence_embs:
-            similarities = np.dot(chunk_embs, sent_emb) / (
-                np.linalg.norm(chunk_embs, axis=1) * np.linalg.norm(sent_emb)
-            )
-            max_sim = np.max(similarities)
-
-            if max_sim >= threshold:
-                supported_count += 1
-
-        return supported_count / len(sentences)
+        super().__init__(embed_model=embed_model, use_bertscore=False)
 
     def compute_all(
         self, prediction: str, ground_truth: str, context_chunks: List[str]
     ) -> Dict[str, float]:
-        """Compute all metrics."""
+        """Compute EM, F1, ROUGE-L, faithfulness (legacy interface)."""
         return {
             "exact_match": self.exact_match(prediction, ground_truth),
             "f1": self.f1_score(prediction, ground_truth),
