@@ -8,9 +8,11 @@ Provides:
 - RagasEvaluator: LLM-based metrics via RAGAS (requires Mistral API key)
 - BenchmarkSuite: Full evaluation runner across pipeline configurations
 - RegressionTester: Threshold-based regression detection
+- ErrorAnalyzer: Automatic error categorization into failure modes
 """
 
 from src.evaluation.benchmark_suite import BenchmarkSuite
+from src.evaluation.error_taxonomy import ErrorAnalysis, ErrorAnalyzer
 from src.evaluation.metrics import (
     CostTracker,
     MetricsCalculator,
@@ -26,4 +28,6 @@ __all__ = [
     "RagasEvaluator",
     "BenchmarkSuite",
     "RegressionTester",
+    "ErrorAnalyzer",
+    "ErrorAnalysis",
 ]
