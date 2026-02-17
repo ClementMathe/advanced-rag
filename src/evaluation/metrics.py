@@ -480,6 +480,7 @@ class RagasEvaluator:
     ) -> None:
         self._available = False
         self._llm = None
+        self._embeddings = None
         self._model_name = model_name
 
         resolved_key = api_key or os.environ.get("MISTRAL_API_KEY")
@@ -488,11 +489,21 @@ class RagasEvaluator:
             return
 
         try:
-            from mistralai import Mistral
-            from ragas.llms import llm_factory
+            import warnings
 
-            client = Mistral(api_key=resolved_key)
-            self._llm = llm_factory(model_name, provider="mistral", client=client)
+            from langchain_huggingface import HuggingFaceEmbeddings
+            from langchain_mistralai import ChatMistralAI
+            from ragas.embeddings import LangchainEmbeddingsWrapper
+            from ragas.llms import LangchainLLMWrapper
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                llm = ChatMistralAI(model=model_name, api_key=resolved_key)
+                self._llm = LangchainLLMWrapper(llm)
+                emb = HuggingFaceEmbeddings(
+                    model_name="BAAI/bge-base-en-v1.5",
+                )
+                self._embeddings = LangchainEmbeddingsWrapper(emb)
             self._available = True
             logger.info(f"RAGAS evaluator initialized with {model_name}")
         except ImportError as e:
@@ -552,8 +563,25 @@ class RagasEvaluator:
                 LLMContextRecall(llm=self._llm),
             ]
 
-            result = evaluate(dataset=dataset, metrics=metrics)
-            return dict(result)
+            result = evaluate(
+                dataset=dataset,
+                metrics=metrics,
+                llm=self._llm,
+                embeddings=self._embeddings,
+            )
+            df = result.to_pandas()
+            # Compute mean for each metric column (skip non-numeric)
+            metric_cols = [
+                c
+                for c in df.columns
+                if c not in ("user_input", "response", "retrieved_contexts", "reference")
+            ]
+            means = {}
+            for col in metric_cols:
+                vals = df[col].dropna()
+                if len(vals) > 0:
+                    means[col] = float(vals.mean())
+            return means
         except Exception as e:
             logger.error(f"RAGAS evaluation failed: {e}")
             return {}
