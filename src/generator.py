@@ -193,7 +193,7 @@ Direct answer:"""
 
         return "\n\n".join(context_parts)
 
-    def _generate_text(self, prompt: str) -> str:
+    def _generate_text(self, prompt: str, streamer=None) -> str:
         """
         Generate text from prompt using the LLM.
 
@@ -202,9 +202,11 @@ Direct answer:"""
 
         Args:
             prompt: Input prompt
+            streamer: Optional TextIteratorStreamer for token-by-token streaming
 
         Returns:
-            Generated text
+            Generated text (empty string when streamer is used, since
+            the streamer handles output)
         """
         # Use chat template if available (instruction-tuned models)
         if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template:
@@ -223,23 +225,35 @@ Direct answer:"""
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
+        generate_kwargs = dict(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            do_sample=True if self.temperature > 0 else False,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+        if streamer is not None:
+            generate_kwargs["streamer"] = streamer
+
         # Generate
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                do_sample=True if self.temperature > 0 else False,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
+            outputs = self.model.generate(**generate_kwargs)
+
+        if streamer is not None:
+            return ""
 
         # Decode (skip prompt tokens)
         generated_tokens = outputs[0][inputs["input_ids"].shape[1] :]
         generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
         return generated_text
+
+    def build_prompt(self, query: str, context_chunks: List[Dict], max_chunks: int = 5) -> str:
+        """Build the full prompt for a query (used by streaming endpoint)."""
+        context = self._format_context(context_chunks[:max_chunks])
+        return self.prompt_template.format(context=context, question=query)
 
     def _parse_answer(self, generated_text: str) -> str:
         """

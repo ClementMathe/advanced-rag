@@ -1,0 +1,36 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+venv/
+.venv/
+*.egg
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Testing & Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.mypy_cache/
+
+# Claude
+.claude/
+
+# Misc
+*.md
+!README.md
+logs/
+outputs/
+assets/
+docs/
+.env
+.pre-commit-config.yaml
