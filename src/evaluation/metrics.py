@@ -224,6 +224,7 @@ class MetricsCalculator:
 # Pricing per 1M tokens (USD), as of Feb 2026
 PRICING_TABLE: Dict[str, Dict[str, float]] = {
     "qwen2.5-3b-instruct": {"input": 0.0, "output": 0.0},
+    "mistral-small-latest": {"input": 0.20, "output": 0.60},
     "mistral-large-latest": {"input": 2.0, "output": 6.0},
     "gpt-4o": {"input": 2.50, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},

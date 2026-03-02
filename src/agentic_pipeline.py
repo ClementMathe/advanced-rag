@@ -2,13 +2,15 @@
 Agentic RAG pipeline with adaptive retrieval, web search fallback, and optional answer grading.
 
 Workflow:
-  retrieve → [check quality → fallback] → [check web → web search] → generate → [grade → retry] → END
+  retrieve → [check quality → fallback] → [doc grading] → [check web → web search] → generate → [grade → retry] → END
 
 This module provides AgenticRAGPipeline, a LangGraph-based workflow with
 self-correction mechanisms (feature flags for ablation testing):
 
 - Adaptive retrieval: if primary retrieval produces low rerank scores,
   falls back to an alternative retrieval strategy (wider candidate pool).
+- Document grading: LLM filters retrieved documents for relevance. Optionally
+  rewrites the query and re-retrieves when too few documents pass.
 - Web search: if retrieval quality is still poor after local retrieval,
   supplements context with DuckDuckGo web search results.
 - Answer grading: LLM checks if the generated answer addresses the query.
@@ -22,7 +24,7 @@ from langgraph.graph import END, StateGraph
 from loguru import logger
 
 from src.generator import LLMGenerator
-from src.graders import AnswerGrader
+from src.graders import AnswerGrader, DocumentGrader, QueryRewriter
 from src.reranker import CrossEncoderReranker
 from src.retriever import HybridRetriever
 from src.utils import Timer
@@ -41,6 +43,8 @@ class RAGState(TypedDict):
         used_fallback_retrieval: Whether fallback retrieval strategy was used.
         used_web_search: Whether web search was used to supplement context.
         answer_is_acceptable: Whether answer passed quality grading.
+        num_docs_graded: Number of documents that passed LLM document grading.
+            -1 when document grading is disabled.
         intermediate_steps: Log of actions taken at each node (auto-appended).
     """
 
@@ -52,6 +56,7 @@ class RAGState(TypedDict):
     used_fallback_retrieval: bool
     used_web_search: bool
     answer_is_acceptable: bool
+    num_docs_graded: int
     intermediate_steps: Annotated[List[str], operator.add]
 
 
@@ -114,6 +119,8 @@ class AgenticRAGPipeline:
         reranker: CrossEncoderReranker,
         generator: LLMGenerator,
         answer_grader: Optional[AnswerGrader] = None,
+        doc_grader: Optional[DocumentGrader] = None,
+        query_rewriter: Optional[QueryRewriter] = None,
         fallback_retriever: Optional[HybridRetriever] = None,
         web_search_tool: Optional[DuckDuckGoSearchTool] = None,
         k_retrieve: int = 20,
@@ -122,6 +129,8 @@ class AgenticRAGPipeline:
         max_retries: int = 1,
         enable_adaptive_retrieval: bool = False,
         retrieval_threshold: float = 0.0,
+        enable_doc_grading: bool = False,
+        min_relevant_docs: int = 1,
         enable_web_search: bool = False,
         web_search_threshold: float = -5.0,
         enable_answer_grading: bool = False,
@@ -136,6 +145,10 @@ class AgenticRAGPipeline:
             reranker: CrossEncoderReranker instance for reranking.
             generator: LLMGenerator instance for answer generation.
             answer_grader: AnswerGrader instance (required if answer grading enabled).
+            doc_grader: DocumentGrader instance for LLM-based document filtering.
+                Required when enable_doc_grading=True.
+            query_rewriter: QueryRewriter instance for query improvement.
+                Used during doc grading when too few documents pass.
             fallback_retriever: Alternative HybridRetriever for fallback strategy.
                 Defaults to hybrid_retriever (wider retrieval with same strategy).
             web_search_tool: DuckDuckGoSearchTool for web search fallback.
@@ -147,6 +160,8 @@ class AgenticRAGPipeline:
             max_retries: Maximum generation retry attempts (default 1).
             enable_adaptive_retrieval: Enable retrieval quality fallback.
             retrieval_threshold: Min rerank score for acceptable retrieval quality.
+            enable_doc_grading: Enable LLM-based document relevance filtering.
+            min_relevant_docs: Min docs needed to skip query rewriting (default 1).
             enable_web_search: Enable web search fallback on poor retrieval.
             web_search_threshold: Min rerank score to skip web search (default -5.0).
             enable_answer_grading: Enable LLM answer quality checks.
@@ -158,12 +173,16 @@ class AgenticRAGPipeline:
         self.reranker = reranker
         self.generator = generator
         self.answer_grader = answer_grader
+        self.doc_grader = doc_grader
+        self.query_rewriter = query_rewriter
         self.k_retrieve = k_retrieve
         self.k_rerank = k_rerank
         self.fallback_k_retrieve = fallback_k_retrieve or k_retrieve * 2
         self.max_retries = max_retries
         self.enable_adaptive_retrieval = enable_adaptive_retrieval
         self.retrieval_threshold = retrieval_threshold
+        self.enable_doc_grading = enable_doc_grading
+        self.min_relevant_docs = min_relevant_docs
         self.enable_web_search = enable_web_search
         self.web_search_threshold = web_search_threshold
         self.enable_answer_grading = enable_answer_grading
@@ -172,6 +191,9 @@ class AgenticRAGPipeline:
 
         if enable_answer_grading and answer_grader is None:
             raise ValueError("answer_grader is required when enable_answer_grading=True")
+
+        if enable_doc_grading and doc_grader is None:
+            raise ValueError("doc_grader is required when enable_doc_grading=True")
 
         if enable_web_search:
             self.web_search_tool = web_search_tool or DuckDuckGoSearchTool()
@@ -185,6 +207,11 @@ class AgenticRAGPipeline:
             flags.append(
                 f"adaptive_retrieval(threshold={retrieval_threshold}, "
                 f"fallback_k={self.fallback_k_retrieve})"
+            )
+        if enable_doc_grading:
+            flags.append(
+                f"doc_grading(min_relevant={min_relevant_docs}, "
+                f"rewrite={'yes' if query_rewriter else 'no'})"
             )
         if enable_web_search:
             flags.append(f"web_search(threshold={web_search_threshold})")
@@ -206,6 +233,7 @@ class AgenticRAGPipeline:
         Graph structure varies by configuration:
         - Linear: retrieve -> generate -> END
         - Adaptive: retrieve -> decide_quality -> [generate | fallback -> generate]
+        - Doc grading: ... -> grade_documents -> generate
         - Web search: ... -> check_web -> [generate | web_search -> generate]
         - With answer grading: ... -> generate -> grade_answer -> [END | generate]
 
@@ -219,7 +247,7 @@ class AgenticRAGPipeline:
 
         workflow.set_entry_point("retrieve")
 
-        # Determine node before generate (chain: retrieve → [adaptive] → [web] → generate)
+        # Build chain: retrieve → [adaptive] → [doc_grade] → [web] → generate
         next_after_retrieval = "generate"
 
         if self.enable_web_search:
@@ -235,6 +263,12 @@ class AgenticRAGPipeline:
             )
             workflow.add_edge("web_search", "generate")
             next_after_retrieval = "check_web"
+
+        # Document grading node (inserted between retrieval and web/generate)
+        if self.enable_doc_grading:
+            workflow.add_node("grade_documents", self._grade_documents_node)
+            workflow.add_edge("grade_documents", next_after_retrieval)
+            next_after_retrieval = "grade_documents"
 
         # Retrieval routing
         if self.enable_adaptive_retrieval:
@@ -364,6 +398,63 @@ class AgenticRAGPipeline:
             "documents": reranked,
             "min_rerank_score": min_score,
             "used_fallback_retrieval": True,
+            "intermediate_steps": [step],
+        }
+
+    def _grade_documents_node(self, state: RAGState) -> dict:
+        """Filter retrieved documents using LLM-based relevance grading.
+
+        Calls doc_grader.grade_batch() to filter documents for relevance.
+        When too few documents pass (< min_relevant_docs) and a query_rewriter
+        is configured, rewrites the query and re-retrieves a fresh candidate set,
+        then re-grades the new candidates.
+
+        Args:
+            state: Current graph state with documents.
+
+        Returns:
+            State update with filtered documents and num_docs_graded.
+        """
+        query = state["query"]
+        docs = state.get("documents", [])
+
+        if not docs:
+            step = "Doc grading: no documents to grade"
+            logger.info(step)
+            return {"num_docs_graded": 0, "intermediate_steps": [step]}
+
+        doc_contents = [d.get("content", "") for d in docs]
+        grades = self.doc_grader.grade_batch(query, doc_contents)
+        relevant_docs = [d for d, g in zip(docs, grades) if g]
+        num_relevant = len(relevant_docs)
+
+        # Query rewrite + re-retrieve when too few pass and rewriter is available
+        if num_relevant < self.min_relevant_docs and self.query_rewriter:
+            rewritten = self.query_rewriter.rewrite(query, len(docs), num_relevant)
+
+            with Timer("Re-retrieval after query rewrite"):
+                candidates = self.retriever.search(rewritten, k=self.k_retrieve, k_retriever=50)
+            reranked = self.reranker.rerank(rewritten, candidates, top_k=self.k_rerank)
+
+            doc_contents2 = [d.get("content", "") for d in reranked]
+            grades2 = self.doc_grader.grade_batch(rewritten, doc_contents2)
+            relevant_docs2 = [d for d, g in zip(reranked, grades2) if g]
+
+            if relevant_docs2:
+                relevant_docs = relevant_docs2
+            elif reranked:
+                relevant_docs = reranked  # permissive fallback
+
+        # Final fallback: if all docs filtered, keep originals (don't return empty)
+        final_docs = relevant_docs if relevant_docs else docs
+        num_graded = len(relevant_docs)
+
+        step = f"Doc grading: {num_graded}/{len(docs)} relevant"
+        logger.info(step)
+
+        return {
+            "documents": final_docs,
+            "num_docs_graded": num_graded,
             "intermediate_steps": [step],
         }
 
@@ -576,6 +667,7 @@ class AgenticRAGPipeline:
             "used_fallback_retrieval": False,
             "used_web_search": False,
             "answer_is_acceptable": True,
+            "num_docs_graded": -1,
             "intermediate_steps": [],
         }
 
@@ -601,4 +693,5 @@ class AgenticRAGPipeline:
             "used_fallback_retrieval": final_state.get("used_fallback_retrieval", False),
             "used_web_search": final_state.get("used_web_search", False),
             "answer_is_acceptable": final_state.get("answer_is_acceptable", True),
+            "num_docs_graded": final_state.get("num_docs_graded", -1),
         }

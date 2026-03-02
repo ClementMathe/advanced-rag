@@ -69,6 +69,7 @@ outputs/chunking_comparison
 outputs/retrieval_test
 data/cache
 data/squad
+data/hotpot/
 
 # Model downloads (HuggingFace cache)
 models/
